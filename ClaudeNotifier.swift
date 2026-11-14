@@ -146,15 +146,20 @@ func estimate(_ session: Session) -> String {
     guard let started = session.started else { return "Working" }
     let elapsed = Date().timeIntervalSince(started)
     let ran = "Working for \(duration(elapsed))"
-    let history = (try? String(contentsOf: notifierDir.appendingPathComponent("history.jsonl"), encoding: .utf8)) ?? ""
-    let past = history.split(separator: "\n").suffix(50).compactMap { line -> Double? in
-        guard let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return nil }
-        return json["seconds"] as? Double
-    }.sorted()
+    let past = pastDurations().sorted()
     guard past.count >= 3 else { return "\(ran) · no estimate yet (needs a few finished prompts)" }
     let typical = past[past.count / 2]
     if elapsed < typical { return "\(ran) · rough ETA ~\(duration(typical - elapsed)) (typical prompt \(duration(typical)))" }
     return "\(ran) · longer than a typical prompt (\(duration(typical)))"
+}
+
+/// How long your recent finished prompts took, in seconds.
+var pastDurations: () -> [Double] = {
+    let history = (try? String(contentsOf: notifierDir.appendingPathComponent("history.jsonl"), encoding: .utf8)) ?? ""
+    return history.split(separator: "\n").suffix(50).compactMap { line -> Double? in
+        guard let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return nil }
+        return json["seconds"] as? Double
+    }
 }
 
 func duration(_ seconds: TimeInterval) -> String {
@@ -444,7 +449,13 @@ struct SessionCard: View {
 struct DetailView: View {
     @ObservedObject var model: DashboardModel
     let session: Session
-    @State private var prompt = ""
+    @State private var prompt: String
+
+    init(model: DashboardModel, session: Session, prompt: String = "") {
+        self.model = model
+        self.session = session
+        _prompt = State(initialValue: prompt)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -493,9 +504,17 @@ struct DetailView: View {
 struct NewSessionView: View {
     @ObservedObject var model: DashboardModel
     @Binding var isPresented: Bool
-    @State private var directory = FileManager.default.homeDirectoryForCurrentUser.path
+    @State private var directory: String
     /// The session to copy the context of; nil for fresh context.
     @State private var source: String?
+
+    init(model: DashboardModel, isPresented: Binding<Bool>,
+         directory: String = FileManager.default.homeDirectoryForCurrentUser.path, source: String? = nil) {
+        self.model = model
+        _isPresented = isPresented
+        _directory = State(initialValue: directory)
+        _source = State(initialValue: source)
+    }
 
     var forkable: [Session] { model.sessions.filter { $0.file != nil } }
 
@@ -551,7 +570,11 @@ struct NewSessionView: View {
         isPresented = false
     }
 
+    /// Lets the screenshots show a demo folder that does not exist.
+    static var anyDirectory = false
+
     func isDirectory(_ path: String) -> Bool {
+        if NewSessionView.anyDirectory { return true }
         var dir: ObjCBool = false
         return FileManager.default.fileExists(atPath: (path as NSString).expandingTildeInPath, isDirectory: &dir) && dir.boolValue
     }
@@ -795,7 +818,126 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
     }
 }
 
+// MARK: - Screenshots
+
+/// `ClaudeNotifier --screenshots <dir>` draws the dashboard's views offscreen,
+/// with demo sessions, into PNGs for the README. No screen capture is involved.
+enum Screenshots {
+    static func demo() -> (sessions: [Session], tabs: [String: TerminalTab]) {
+        let now = Date()
+        // Under the home folder, so paths show as ~/code/….
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        func session(_ tty: String, _ state: String, _ cwd: String, _ branch: String, _ task: String,
+                     message: String = "", started: TimeInterval? = nil, ago: TimeInterval) -> Session {
+            Session(id: "demo-\(tty)", file: URL(fileURLWithPath: "/demo/\(tty).json"), state: state,
+                    cwd: home + "/code/\(cwd)", branch: branch, tty: "/dev/\(tty)", task: task, message: message,
+                    started: started.map { now.addingTimeInterval(-$0) }, time: now.addingTimeInterval(-ago))
+        }
+        let sessions = [
+            session("ttys001", "input", "weather-app", "feat/radar", "Add a radar overlay to the map view and cache the tiles",
+                    message: "Claude needs your permission to use Bash", started: 380, ago: 40),
+            session("ttys002", "working", "api-server", "fix/rate-limit", "Fix the 429s the rate limiter returns under bursts of traffic",
+                    started: 250, ago: 250),
+            session("ttys003", "done", "blog", "main", "Write the release notes for v2.3 from the PRs merged since v2.2",
+                    started: 900, ago: 120),
+            Session(id: "demo-idle", file: nil, state: "idle", cwd: home + "/code/scratch", branch: "", tty: "/dev/ttys004",
+                    task: "", message: "", started: nil, time: .distantPast),
+        ]
+        func rgb(_ r: Double, _ g: Double, _ b: Double) -> Color { Color(red: r / 255, green: g / 255, blue: b / 255) }
+        let tabs: [String: TerminalTab] = [
+            "/dev/ttys001": TerminalTab(title: "Radar overlay", window: "weather-app — Radar overlay — claude — 160×48", contents: """
+            ⏺ I'll fetch the tile manifest to size the cache.
+
+            ╭──────────────────────────────────────────────────────╮
+            │ Bash command                                         │
+            │   curl -s https://tiles.example.com/radar/manifest   │
+            │ Do you want to proceed?                              │
+            │ ❯ 1. Yes                                             │
+            │   2. Yes, and don't ask again for curl               │
+            │   3. No, and tell Claude what to do differently      │
+            ╰──────────────────────────────────────────────────────╯
+            """, background: rgb(40, 42, 54), foreground: rgb(248, 248, 242)),
+            "/dev/ttys002": TerminalTab(title: "Rate limit fix", window: "api-server — Rate limit fix — claude — 160×48", contents: """
+            ⏺ The limiter refills its bucket once a second, so a burst of
+              50 requests at 0.9s empties it before the refill.
+
+            ⏺ Update(src/limiter.ts)
+              ⎿  Updated src/limiter.ts with 6 additions and 2 removals
+
+            ⏺ Bash(npm test -- limiter)
+              ⎿  PASS  test/limiter.test.ts
+                   ✓ allows a burst of 50 within the window (12 ms)
+                   ✓ refills continuously instead of once a second (8 ms)
+
+            ✻ Running the full suite…
+            """, background: rgb(16, 31, 52), foreground: rgb(205, 220, 240)),
+            "/dev/ttys003": TerminalTab(title: "Release notes", window: "blog — Release notes — claude — 160×48", contents: """
+            ⏺ Wrote posts/2024-release-2-3.md:
+
+              ## What's new in 2.3
+              - Offline mode for saved articles (#412)
+              - Faster search, about 3x on large blogs (#398)
+              - Dark mode follows the system setting (#405)
+
+              Fixed: broken RSS dates, image captions in dark mode.
+
+            ✻ Cooked for 15m 2s · done 3:41 PM
+            """, background: rgb(12, 36, 24), foreground: rgb(222, 240, 226)),
+            "/dev/ttys004": TerminalTab(title: "", window: "scratch — claude — 120×40", contents: "you@mac scratch % claude",
+                                        background: rgb(30, 30, 30), foreground: rgb(220, 220, 220)),
+        ]
+        return (sessions, tabs)
+    }
+
+    /// Draws `view` in an offscreen window titled `title` and saves it as a PNG.
+    static func save<V: View>(_ view: V, title: String, size: NSSize, to url: URL) {
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = title
+        let host = NSHostingView(rootView: view)
+        host.sizingOptions = []
+        window.contentView = host
+        window.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+        window.orderFrontRegardless()
+        RunLoop.main.run(until: Date().addingTimeInterval(1))
+        // The frame view includes the title bar.
+        let frame = window.contentView!.superview!
+        guard let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) else { return }
+        frame.cacheDisplay(in: frame.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: url)
+        window.orderOut(nil)
+    }
+
+    static func run(into dir: URL) {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        pastDurations = { [300, 420, 540, 600, 720] }
+        let (sessions, tabs) = demo()
+        let model = DashboardModel()
+        model.sessions = sessions
+        model.tabs = tabs
+        save(DashboardView(model: model), title: "Claude Sessions", size: NSSize(width: 980, height: 720),
+             to: dir.appendingPathComponent("dashboard.png"))
+
+        let working = sessions[1]
+        model.selected = working
+        model.detail = tabs[working.tty]!.contents
+        save(DetailView(model: model, session: working, prompt: "Also add a test for two bursts back to back"),
+             title: "Claude Sessions", size: NSSize(width: 860, height: 600), to: dir.appendingPathComponent("detail.png"))
+
+        model.selected = nil
+        NewSessionView.anyDirectory = true
+        save(NewSessionView(model: model, isPresented: .constant(true), directory: "~/code/weather-app-v2",
+                            source: sessions[0].id),
+             title: "New Claude session", size: NSSize(width: 560, height: 330), to: dir.appendingPathComponent("new-session.png"))
+    }
+}
+
 let app = NSApplication.shared
+if let flag = CommandLine.arguments.firstIndex(of: "--screenshots"), CommandLine.arguments.count > flag + 1 {
+    app.setActivationPolicy(.accessory)
+    Screenshots.run(into: URL(fileURLWithPath: CommandLine.arguments[flag + 1]))
+    exit(0)
+}
 let delegate = Notifier()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
