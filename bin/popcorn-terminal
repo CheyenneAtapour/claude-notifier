@@ -1,0 +1,35 @@
+#!/bin/bash
+# Opens a Popcorn Terminal window (a random theme from macos-terminal-themes)
+# in `dir`, optionally running `command` there.
+#
+# Usage: popcorn-terminal [dir] [command]
+set -euo pipefail
+
+dir="$(cd "${1:-$PWD}" && pwd)"
+command="${2:-}"
+# Set POPCORN_THEMES to a folder of .terminal files to use other themes.
+themes="${POPCORN_THEMES:-$HOME/Documents/github/random/macos-terminal-themes/themes}"
+
+theme_file=$(ls "$themes"/*.terminal | awk 'BEGIN { srand() } { a[NR] = $0 } END { print a[int(rand() * NR) + 1] }')
+theme=$(basename "$theme_file" .terminal)
+
+osascript - "$theme_file" "$theme" "$dir" "$command" <<'APPLESCRIPT'
+on run {themeFile, themeName, workDir, command}
+	-- Opening the .terminal file opens a window in that theme, as Popcorn Terminal does.
+	tell application "Terminal" to set beforeCount to count windows
+	do shell script "open " & quoted form of themeFile
+	repeat 50 times
+		tell application "Terminal" to set afterCount to count windows
+		if afterCount > beforeCount then exit repeat
+		delay 0.1
+	end repeat
+	set script_ to "export THEME_PROFILE=" & quoted form of themeName & " CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; cd " & quoted form of workDir
+	if command is not "" then set script_ to script_ & " && " & command
+	tell application "Terminal"
+		activate
+		do script script_ in front window
+		set custom title of front window to themeName
+	end tell
+end run
+APPLESCRIPT
+echo "Opened a '$theme' window in $dir${command:+ running: $command}"

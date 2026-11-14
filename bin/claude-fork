@@ -1,0 +1,15 @@
+#!/bin/bash
+# Opens a Popcorn Terminal window running a fork of a Claude Code session,
+# which starts with that session's whole conversation and then goes its own way.
+#
+# Usage: claude-fork [session-id] [dir]
+#   session-id  the session to fork; default: the latest one in `dir`
+#   dir         where the fork starts; default: the current directory
+set -euo pipefail
+
+session="${1:-}"
+dir="${2:-$PWD}"
+if [ -n "$session" ]; then
+  exec "$(dirname "$0")/popcorn-terminal" "$dir" "claude --resume $session --fork-session"
+fi
+exec "$(dirname "$0")/popcorn-terminal" "$dir" "claude --continue --fork-session"

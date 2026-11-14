@@ -1,0 +1,802 @@
+// Claude Notifier: a menu bar item counting Claude Code sessions waiting for
+// you, red for finished and green for blocked on you, and a dashboard of every
+// open Claude session. Sessions are files in ~/.claude/notifier/sessions,
+// written by hook.sh.
+import AppKit
+import SwiftUI
+
+let notifierDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/notifier")
+let sessionsDir = notifierDir.appendingPathComponent("sessions")
+
+/// Appends `message` to ~/.claude/notifier/notifier.log.
+func log(_ message: String) {
+    let url = notifierDir.appendingPathComponent("notifier.log")
+    let line = Data("\(Date()) \(message)\n".utf8)
+    if let handle = try? FileHandle(forWritingTo: url) {
+        handle.seekToEndOfFile()
+        handle.write(line)
+        try? handle.close()
+    } else {
+        try? line.write(to: url)
+    }
+}
+
+// MARK: - Sessions
+
+struct Session: Identifiable {
+    /// The session id, or the terminal for a session with no file yet.
+    let id: String
+    let file: URL?
+    /// "working", "done" (finished its reply), "input" (blocked on you), or "idle" (nothing to report).
+    let state: String
+    let cwd: String
+    let branch: String
+    let tty: String
+    let task: String
+    let message: String
+    let started: Date?
+    let time: Date
+
+    var folder: String { URL(fileURLWithPath: cwd).lastPathComponent }
+
+    var path: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return cwd.hasPrefix(home) ? "~" + cwd.dropFirst(home.count) : cwd
+    }
+
+    var place: String { branch.isEmpty ? path : "\(path) (\(branch))" }
+
+    func name(_ tabs: [String: TerminalTab]) -> String {
+        let title = tabs[tty]?.title ?? ""
+        if cwd.isEmpty { return title.isEmpty ? tty : title }
+        return title.isEmpty ? folder : "\(folder) — \(title)"
+    }
+}
+
+/// The session files of open Claude sessions, plus a placeholder for each
+/// running Claude with no file yet. A file whose terminal no longer runs Claude
+/// belongs to a closed session and is skipped.
+func loadSessions() -> [Session] {
+    let running = claudeProcesses()
+    let files = (try? FileManager.default.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
+    let all: [Session] = files.filter { $0.pathExtension == "json" }.compactMap { url in
+        guard let data = try? Data(contentsOf: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let tty = json["tty"] as? String ?? ""
+        guard tty.isEmpty || running[tty] != nil else { return nil }
+        return Session(
+            id: url.deletingPathExtension().lastPathComponent,
+            file: url,
+            state: json["state"] as? String ?? "done",
+            cwd: json["cwd"] as? String ?? "",
+            branch: json["branch"] as? String ?? "",
+            tty: tty,
+            task: json["task"] as? String ?? "",
+            message: json["message"] as? String ?? "",
+            started: (json["started"] as? Double).map { Date(timeIntervalSince1970: $0) },
+            time: Date(timeIntervalSince1970: json["time"] as? Double ?? 0)
+        )
+    }
+    // A terminal can hold a closed session's file and a newer session; keep the newest.
+    var seen = Set<String>()
+    var sessions = all.sorted { $0.time > $1.time }.filter { $0.tty.isEmpty || seen.insert($0.tty).inserted }
+    for (tty, pid) in running where !seen.contains(tty) {
+        let (cwd, branch) = place(of: pid)
+        sessions.append(Session(id: tty, file: nil, state: "idle", cwd: cwd, branch: branch, tty: tty, task: "",
+                                message: "", started: nil, time: .distantPast))
+    }
+    // Those needing you first, then working, then done, then idle; within each,
+    // the one you prompted most recently first. Ties (such as sessions with no
+    // prompt seen) go by terminal, so they keep their places between refreshes.
+    let rank = ["input": 0, "working": 1, "done": 2]
+    return sessions.sorted {
+        (rank[$0.state] ?? 3, -($0.started ?? .distantPast).timeIntervalSince1970, $0.tty, $0.id)
+            < (rank[$1.state] ?? 3, -($1.started ?? .distantPast).timeIntervalSince1970, $1.tty, $1.id)
+    }
+}
+
+/// Runs `tool` with `arguments` and returns what it prints.
+func output(_ tool: String, _ arguments: [String]) -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: tool)
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    guard (try? process.run()) != nil else { return "" }
+    let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    return out
+}
+
+/// Running `claude` processes with a terminal: their device (e.g. /dev/ttys003) to their pid.
+func claudeProcesses() -> [String: Int] {
+    var processes: [String: Int] = [:]
+    for line in output("/bin/ps", ["-axo", "pid=,tty=,comm="]).split(separator: "\n") {
+        let parts = line.split(separator: " ", maxSplits: 2)
+        guard parts.count == 3, parts[1] != "??", let pid = Int(parts[0]),
+              parts[2].trimmingCharacters(in: .whitespaces).split(separator: "/").last == "claude" else { continue }
+        processes["/dev/\(parts[1])"] = pid
+    }
+    return processes
+}
+
+/// A process's working directory and its git branch, cached by pid.
+var places: [Int: (cwd: String, branch: String)] = [:]
+func place(of pid: Int) -> (cwd: String, branch: String) {
+    if let known = places[pid] { return known }
+    let cwd = output("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"])
+        .split(separator: "\n").first { $0.hasPrefix("n") }.map { String($0.dropFirst()) } ?? ""
+    let branch = cwd.isEmpty ? "" : output("/usr/bin/git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    places[pid] = (cwd, branch)
+    return (cwd, branch)
+}
+
+/// Where the session is up to; for a working one, a rough estimate of the time
+/// left: the median time your past prompts took, less the time this one has run.
+func estimate(_ session: Session) -> String {
+    let ago = RelativeDateTimeFormatter()
+    switch session.state {
+    case "done": return "Finished \(ago.localizedString(for: session.time, relativeTo: Date()))"
+    case "input": return "Waiting on you since \(ago.localizedString(for: session.time, relativeTo: Date()))"
+    case "idle": return session.file == nil ? "No activity since the notifier started" : "Idle"
+    default: break
+    }
+    guard let started = session.started else { return "Working" }
+    let elapsed = Date().timeIntervalSince(started)
+    let ran = "Working for \(duration(elapsed))"
+    let history = (try? String(contentsOf: notifierDir.appendingPathComponent("history.jsonl"), encoding: .utf8)) ?? ""
+    let past = history.split(separator: "\n").suffix(50).compactMap { line -> Double? in
+        guard let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return nil }
+        return json["seconds"] as? Double
+    }.sorted()
+    guard past.count >= 3 else { return "\(ran) · no estimate yet (needs a few finished prompts)" }
+    let typical = past[past.count / 2]
+    if elapsed < typical { return "\(ran) · rough ETA ~\(duration(typical - elapsed)) (typical prompt \(duration(typical)))" }
+    return "\(ran) · longer than a typical prompt (\(duration(typical)))"
+}
+
+func duration(_ seconds: TimeInterval) -> String {
+    let s = Int(seconds)
+    return s < 60 ? "\(s)s" : s < 3600 ? "\(s / 60)m" : "\(s / 3600)h \(s % 3600 / 60)m"
+}
+
+// MARK: - Terminal
+
+struct TerminalTab {
+    /// The tab's own title (Claude Code sets the session's), without status symbols.
+    let title: String
+    /// The whole window title.
+    let window: String
+    /// The text on screen.
+    let contents: String
+    /// The tab's background and text colours.
+    let background: Color
+    let foreground: Color
+}
+
+enum Terminal {
+    static let field = "\u{1F}", record = "\u{1E}"
+
+    /// Each Terminal tab, by its terminal device.
+    static func tabs(withContents: Bool) -> [String: TerminalTab] {
+        let source = """
+        tell application "Terminal"
+            set out to ""
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set n to ""
+                    if title displays custom title of t then set n to custom title of t
+                    set c to ""
+                    -- On a loop variable, `contents of` alone dereferences it and returns the tab.
+                    if \(withContents) then set c to contents of (contents of t)
+                    set b to background color of t
+                    set f to normal text color of t
+                    set rgb to "" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 1 of f) & "," & (item 2 of f) & "," & (item 3 of f)
+                    set out to out & (tty of t) & (character id 31) & n & (character id 31) & (name of w) & (character id 31) & rgb & (character id 31) & c & (character id 30)
+                end repeat
+            end repeat
+            return out
+        end tell
+        """
+        guard let out = run(source) else { return [:] }
+        var tabs: [String: TerminalTab] = [:]
+        for item in out.components(separatedBy: record) {
+            let parts = item.components(separatedBy: field)
+            guard parts.count == 5 else { continue }
+            // Terminal's colour components run from 0 to 65535.
+            let c = parts[3].split(separator: ",").map { (Double($0) ?? 0) / 65535 }
+            let colors = c.count == 6
+                ? (Color(red: c[0], green: c[1], blue: c[2]), Color(red: c[3], green: c[4], blue: c[5]))
+                : (Color(white: 0.1), Color(white: 0.92))
+            tabs[parts[0]] = TerminalTab(title: clean(parts[1]), window: clean(parts[2]), contents: parts[4],
+                                         background: colors.0, foreground: colors.1)
+        }
+        return tabs
+    }
+
+    /// The scrollback of the tab on `tty`, up to its last `lines` lines.
+    static func history(tty: String, lines: Int) -> String {
+        let source = """
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(tty)" then return history of t
+                end repeat
+            end repeat
+            return ""
+        end tell
+        """
+        return tail(run(source) ?? "", lines)
+    }
+
+    /// Raises the window whose tab is on `tty` and selects that tab; just
+    /// brings Terminal forward if none is.
+    static func focus(tty: String) {
+        _ = run("""
+        tell application "Terminal"
+            activate
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(tty)" then
+                        set selected of t to true
+                        set index of w to 1
+                        return
+                    end if
+                end repeat
+            end repeat
+        end tell
+        """)
+    }
+
+    /// Types `text` into the tab on `tty` and presses Return, as if you had
+    /// typed it there. Line breaks become spaces: each would submit on its own.
+    static func send(_ text: String, to tty: String) {
+        let line = text.components(separatedBy: .newlines).joined(separator: " ")
+            .replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        _ = run("""
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(tty)" then
+                        do script "\(line)" in t
+                        return
+                    end if
+                end repeat
+            end repeat
+        end tell
+        """)
+    }
+
+    /// The selected tab of Terminal's front window, if Terminal is the app in front.
+    static func focusedTab() -> String? {
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal" else { return nil }
+        return run("tell application \"Terminal\" to get tty of selected tab of front window")
+    }
+
+    /// Opens a Popcorn Terminal window (a random theme) in `dir`, running
+    /// `command` there if given, else a plain shell.
+    static func popcorn(in dir: String, running command: String? = nil) {
+        let process = Process()
+        process.executableURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/bin/popcorn-terminal")
+        process.arguments = [dir] + (command.map { [$0] } ?? [])
+        process.standardOutput = FileHandle.nullDevice
+        do { try process.run() } catch { log("Claude Notifier: could not open a Popcorn terminal: \(error)") }
+    }
+
+    static func run(_ source: String) -> String? {
+        var error: NSDictionary?
+        let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
+        if let error { log("Claude Notifier: AppleScript failed: \(error)") }
+        return result?.stringValue
+    }
+
+    /// `text` without the changing status symbols Claude Code puts in titles
+    /// (✳︎, ◐◑◒◓, spinner dots), its spaces collapsed.
+    static func clean(_ text: String) -> String {
+        let kept = text.unicodeScalars.filter { s in
+            !((0x25D0...0x25D3).contains(s.value) || (0x2700...0x27BF).contains(s.value)
+                || (0x2800...0x28FF).contains(s.value) || s.properties.isEmojiPresentation)
+        }
+        return String(String.UnicodeScalarView(kept)).split(separator: " ").joined(separator: " ")
+    }
+
+    /// The last `count` lines of `text` before Claude Code's input box (the
+    /// rule above its ❯ line, and everything under it), without trailing blank lines.
+    static func tail(_ text: String, _ count: Int) -> String {
+        var lines = text.components(separatedBy: "\n")
+        let trimmed = lines.map { $0.trimmingCharacters(in: .whitespaces) }
+        if let box = trimmed.indices.last(where: { i in
+            trimmed[i].hasPrefix("──") && trimmed[(i + 1)...].first(where: { !$0.isEmpty })?.hasPrefix("❯") == true
+        }) {
+            lines.removeSubrange(box...)
+        }
+        while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
+        return lines.suffix(count).joined(separator: "\n")
+    }
+}
+
+// MARK: - Dashboard
+
+final class DashboardModel: ObservableObject {
+    @Published var sessions: [Session] = []
+    @Published var tabs: [String: TerminalTab] = [:]
+    @Published var selected: Session?
+    @Published var detail = ""
+    private var timer: Timer?
+
+    func start() {
+        refresh()
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func refresh() {
+        sessions = loadSessions()
+        tabs = Terminal.tabs(withContents: true)
+        if let selected {
+            self.selected = sessions.first { $0.id == selected.id } ?? selected
+            detail = Terminal.history(tty: selected.tty, lines: 400)
+        }
+    }
+
+    func open(_ session: Session) {
+        selected = session
+        detail = Terminal.history(tty: session.tty, lines: 400)
+    }
+}
+
+/// The label and colour of a session's state.
+func status(_ state: String) -> (label: String, color: Color) {
+    switch state {
+    case "working": ("Working", .blue)
+    case "input": ("Needs you", .green)
+    case "done": ("Done", .red)
+    default: ("Idle", .gray)
+    }
+}
+
+struct StatusPill: View {
+    let state: String
+
+    var body: some View {
+        let (label, color) = status(state)
+        Text(label)
+            .font(.caption.bold())
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(color.opacity(0.18)))
+            .foregroundStyle(color)
+    }
+}
+
+struct TerminalText: View {
+    let text: String
+    let size: CGFloat
+    /// The terminal's own colours, if known.
+    var tab: TerminalTab?
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Text(text.isEmpty ? " " : text)
+                    .font(.system(size: size, design: .monospaced))
+                    .foregroundStyle(tab?.foreground ?? Color(white: 0.92))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(8)
+                    .id("end")
+            }
+            .onAppear { proxy.scrollTo("end", anchor: .bottom) }
+            .onChange(of: text) { proxy.scrollTo("end", anchor: .bottom) }
+        }
+        .background(RoundedRectangle(cornerRadius: 6).fill(tab?.background ?? Color(white: 0.1)))
+    }
+}
+
+struct SessionCard: View {
+    let session: Session
+    let tabs: [String: TerminalTab]
+    /// The card's size; its preview takes whatever height is left.
+    let size: CGSize
+    let open: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                StatusPill(state: session.state)
+                Text(session.name(tabs)).font(.headline).lineLimit(1)
+                Spacer()
+                Button("Bring to front") { Terminal.focus(tty: session.tty) }
+                    .controlSize(.small)
+            }
+            if !session.cwd.isEmpty {
+                Text(session.place).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Text(session.task.isEmpty ? "No prompt seen yet" : session.task)
+                .font(.callout).lineLimit(2)
+                .foregroundStyle(session.task.isEmpty ? .secondary : .primary)
+            if session.state == "input" {
+                Text(session.message).font(.caption).foregroundStyle(.green).lineLimit(1)
+            }
+            Text(estimate(session)).font(.caption).foregroundStyle(.secondary)
+            TerminalText(text: Terminal.tail(tabs[session.tty]?.contents ?? "", 40),
+                         size: max(7, min(11, size.width / 48)), tab: tabs[session.tty])
+                .frame(maxHeight: .infinity)
+                .allowsHitTesting(false)
+        }
+        .padding(12)
+        .frame(width: size.width, height: size.height, alignment: .top)
+        .background(RoundedRectangle(cornerRadius: 10).fill(status(session.state).color.opacity(0.12)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(status(session.state).color.opacity(0.35)))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: open)
+        .help("Click for a larger view")
+    }
+}
+
+struct DetailView: View {
+    @ObservedObject var model: DashboardModel
+    let session: Session
+    @State private var prompt = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Button { model.selected = nil } label: { Label("All sessions", systemImage: "chevron.left") }
+                Spacer()
+                Button("New Popcorn terminal here") { Terminal.popcorn(in: session.cwd) }
+                    .disabled(session.cwd.isEmpty)
+                    .help(session.cwd.isEmpty ? "This session's directory is unknown" : "A plain shell in \(session.path)")
+                Button("Bring to front") { Terminal.focus(tty: session.tty) }
+                    .keyboardShortcut(.defaultAction)
+            }
+            HStack {
+                StatusPill(state: session.state)
+                Text(session.name(model.tabs)).font(.title3.bold()).lineLimit(1)
+            }
+            if !session.cwd.isEmpty { Text(session.place).font(.callout).foregroundStyle(.secondary) }
+            if !session.task.isEmpty { Text(session.task).font(.callout).lineLimit(4) }
+            if session.state == "input" { Text(session.message).foregroundStyle(.green) }
+            Text(estimate(session)).font(.caption).foregroundStyle(.secondary)
+            TerminalText(text: model.detail, size: 11, tab: model.tabs[session.tty])
+            HStack(alignment: .bottom) {
+                TextField("Type a prompt for this session…", text: $prompt, axis: .vertical)
+                    .lineLimit(1...5)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(send)
+                Button("Send", action: send)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .help("Typed into this session's terminal, then Return. If it is working, Claude queues it.")
+        }
+        .padding(16)
+    }
+
+    func send() {
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        Terminal.send(text, to: session.tty)
+        prompt = ""
+    }
+}
+
+/// Starts Claude in a new Popcorn window: in a directory you choose (or create),
+/// with fresh context or a copy of an open session's.
+struct NewSessionView: View {
+    @ObservedObject var model: DashboardModel
+    @Binding var isPresented: Bool
+    @State private var directory = FileManager.default.homeDirectoryForCurrentUser.path
+    /// The session to copy the context of; nil for fresh context.
+    @State private var source: String?
+
+    var forkable: [Session] { model.sessions.filter { $0.file != nil } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("New Claude session").font(.title3.bold())
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Directory").font(.headline)
+                HStack {
+                    TextField("Directory", text: $directory).textFieldStyle(.roundedBorder)
+                    Button("Choose…", action: choose)
+                }
+                Text("Choose… can also create a new folder.").font(.caption).foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Context").font(.headline)
+                Picker("Context", selection: $source) {
+                    Text("Fresh context").tag(String?.none)
+                    ForEach(forkable) { session in
+                        Text("Copy of \(session.name(model.tabs)) · \(session.place)").tag(Optional(session.id))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.radioGroup)
+                Text("A copy starts with that session's whole conversation, then goes its own way.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { isPresented = false }.keyboardShortcut(.cancelAction)
+                Button("Start", action: start)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!isDirectory(directory))
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+    }
+
+    func choose() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.directoryURL = URL(fileURLWithPath: isDirectory(directory) ? directory : NSHomeDirectory())
+        if panel.runModal() == .OK, let url = panel.url { directory = url.path }
+    }
+
+    func start() {
+        let path = (directory as NSString).expandingTildeInPath
+        Terminal.popcorn(in: path, running: source.map { "claude --resume \($0) --fork-session" } ?? "claude")
+        isPresented = false
+    }
+
+    func isDirectory(_ path: String) -> Bool {
+        var dir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: (path as NSString).expandingTildeInPath, isDirectory: &dir) && dir.boolValue
+    }
+}
+
+struct DashboardView: View {
+    @ObservedObject var model: DashboardModel
+
+    var body: some View {
+        content.frame(minWidth: 520, maxWidth: .infinity, minHeight: 400, maxHeight: .infinity)
+    }
+
+    @State private var creating = false
+
+    @ViewBuilder var content: some View {
+        if let session = model.selected {
+            DetailView(model: model, session: session)
+        } else {
+            VStack(spacing: 0) {
+                HStack {
+                    Text("\(model.sessions.count) Claude sessions").font(.headline)
+                    Spacer()
+                    Button { creating = true } label: { Label("New Claude session…", systemImage: "plus") }
+                }
+                .padding(.horizontal, GridLayout.spacing)
+                .padding(.top, GridLayout.spacing)
+                grid
+            }
+            .sheet(isPresented: $creating) { NewSessionView(model: model, isPresented: $creating) }
+        }
+    }
+
+    @ViewBuilder var grid: some View {
+        GeometryReader { geometry in
+                let layout = GridLayout(count: model.sessions.count, in: geometry.size)
+                let grid = LazyVGrid(
+                    columns: Array(repeating: GridItem(.fixed(layout.card.width), spacing: GridLayout.spacing), count: layout.columns),
+                    spacing: GridLayout.spacing
+                ) {
+                    ForEach(model.sessions) { session in
+                        SessionCard(session: session, tabs: model.tabs, size: layout.card) { model.open(session) }
+                    }
+                }
+                .padding(GridLayout.spacing)
+                if model.sessions.isEmpty {
+                    Text("No Claude sessions are open.").foregroundStyle(.secondary).padding(40)
+                } else if layout.fits {
+                    grid.frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView { grid }
+                }
+            }
+    }
+}
+
+/// The grid that fits every card in the window: the number of columns giving
+/// the largest near-square cards. Only when they would be too small to read
+/// does it fall back to a scrolling grid of readable cards.
+struct GridLayout {
+    static let spacing: CGFloat = 12
+    static let smallest = CGSize(width: 280, height: 230)
+    let columns: Int
+    let card: CGSize
+    let fits: Bool
+
+    init(count: Int, in size: CGSize) {
+        let n = max(count, 1), gap = GridLayout.spacing
+        var best = (columns: 1, card: CGSize.zero, score: -CGFloat.infinity)
+        for columns in 1...n {
+            let rows = (n + columns - 1) / columns
+            let width = (size.width - gap * CGFloat(columns + 1)) / CGFloat(columns)
+            let height = (size.height - gap * CGFloat(rows + 1)) / CGFloat(rows)
+            // Prefer large cards that are close to square.
+            let score = min(width, height * 1.1)
+            if score > best.score { best = (columns, CGSize(width: width, height: height), score) }
+        }
+        let small = GridLayout.smallest
+        if best.card.width >= small.width && best.card.height >= small.height {
+            columns = best.columns
+            // Cards no wider than about square, so a lone card is not a wide strip.
+            card = CGSize(width: min(best.card.width, best.card.height * 1.4), height: best.card.height)
+            fits = true
+        } else {
+            columns = max(1, Int((size.width - gap) / (small.width + gap)))
+            card = small
+            fits = false
+        }
+    }
+}
+
+// MARK: - Menu bar
+
+final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let dashboard = DashboardModel()
+    var window: NSWindow?
+    var timer: Timer?
+    /// The Terminal tab you are looking at, if Terminal is in front.
+    var focused: String?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        let menu = NSMenu()
+        menu.delegate = self
+        item.menu = menu
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        focused = Terminal.focusedTab()
+        // A click in a Terminal window you are already looking at also counts
+        // as seeing it. Watching clicks in other apps needs Accessibility access.
+        AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                guard let self, let tty = Terminal.focusedTab() else { return }
+                self.focused = tty
+                self.seen(tty)
+            }
+        }
+        // Lets a script open the dashboard too.
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(openDashboard), name: Notification.Name("com.cheyenne.claude-notifier.open"), object: nil)
+    }
+
+    func refresh() {
+        // Switching to a finished session's tab clears it; one already in front
+        // when it finished stays until you click in it.
+        let now = Terminal.focusedTab()
+        if let now, now != focused { seen(now) }
+        focused = now
+        let sessions = loadSessions()
+        let done = sessions.filter { $0.state == "done" }.count
+        let waiting = sessions.filter { $0.state == "input" }.count
+        let title = NSMutableAttributedString(string: "✳︎ Claude", attributes: [.font: NSFont.menuBarFont(ofSize: 0)])
+        for (count, color) in [(done, NSColor.systemRed), (waiting, NSColor.systemGreen)] where count > 0 {
+            title.append(NSAttributedString(string: " ● \(count)", attributes: [
+                .foregroundColor: color,
+                .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
+            ]))
+        }
+        item.button?.attributedTitle = title
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let list = loadSessions().filter { $0.state == "done" || $0.state == "input" }
+        let inputs = list.filter { $0.state == "input" }.count
+        let header = NSMenuItem(title: "Claude Notifier — \(list.count - inputs) done, \(inputs) need you", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        let open = NSMenuItem(title: "Open Dashboard…", action: #selector(openDashboard), keyEquivalent: "d")
+        open.target = self
+        menu.addItem(open)
+        menu.addItem(.separator())
+        let ago = RelativeDateTimeFormatter()
+        let tabs = list.isEmpty ? [:] : Terminal.tabs(withContents: false)
+        for session in list {
+            let input = session.state == "input"
+            let what = input ? (session.message.isEmpty ? "needs you" : session.message) : "done"
+            let row = NSMenuItem(title: "", action: #selector(dismiss(_:)), keyEquivalent: "")
+            let label = NSMutableAttributedString(string: "● ", attributes: [.foregroundColor: input ? NSColor.systemGreen : NSColor.systemRed])
+            label.append(NSAttributedString(string: "\(session.name(tabs)) · \(session.place) · \(what), \(ago.localizedString(for: session.time, relativeTo: Date()))"))
+            row.attributedTitle = label
+            row.target = self
+            row.representedObject = session
+            let window = tabs[session.tty]?.window ?? ""
+            row.toolTip = (window.isEmpty ? "" : "\(window)\n") + "\(session.place)\nClick to dismiss and bring its terminal to the front"
+            menu.addItem(row)
+        }
+        if !list.isEmpty {
+            menu.addItem(.separator())
+            let clear = NSMenuItem(title: "Clear all", action: #selector(clearAll), keyEquivalent: "")
+            clear.target = self
+            menu.addItem(clear)
+        }
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Claude Notifier", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    /// Dismissing a finished session marks it idle; one blocked on you stays until it resumes.
+    @objc func dismiss(_ sender: NSMenuItem) {
+        guard let session = sender.representedObject as? Session else { return }
+        if session.state == "done" { markIdle(session) }
+        Terminal.focus(tty: session.tty)
+        refresh()
+    }
+
+    @objc func clearAll() {
+        for session in loadSessions() where session.state == "done" || session.state == "input" { markIdle(session) }
+        refresh()
+    }
+
+    /// Clears the finished session on `tty`, which you are now looking at.
+    func seen(_ tty: String) {
+        var cleared = false
+        for session in loadSessions() where session.tty == tty && session.state == "done" {
+            markIdle(session)
+            cleared = true
+        }
+        if cleared { refresh() }
+    }
+
+    /// Keeps the session's file, so the dashboard still shows its task, but drops it from the counts.
+    func markIdle(_ session: Session) {
+        guard let url = session.file, let data = try? Data(contentsOf: url),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        json["state"] = "idle"
+        if let out = try? JSONSerialization.data(withJSONObject: json) { try? out.write(to: url) }
+    }
+
+    @objc func openDashboard() {
+        if window == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 920, height: 680),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered, defer: false)
+            window.title = "Claude Sessions"
+            window.isReleasedWhenClosed = false
+            // The hosting view would otherwise size the window to the grid's
+            // natural width, which is next to nothing.
+            let host = NSHostingView(rootView: DashboardView(model: dashboard))
+            host.sizingOptions = []
+            window.contentView = host
+            window.contentMinSize = NSSize(width: 520, height: 400)
+            window.delegate = self
+            window.center()
+            if !window.setFrameUsingName("ClaudeNotifierDashboardFrame") || window.frame.width < 520 {
+                window.setContentSize(NSSize(width: 920, height: 680))
+                window.center()
+            }
+            window.setFrameAutosaveName("ClaudeNotifierDashboardFrame")
+            self.window = window
+        }
+        dashboard.start()
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        dashboard.stop()
+        dashboard.selected = nil
+    }
+}
+
+let app = NSApplication.shared
+let delegate = Notifier()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()
