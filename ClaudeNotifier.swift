@@ -28,7 +28,7 @@ struct Session: Identifiable {
     let id: String
     let file: URL?
     /// "working", "done" (finished its reply), "input" (blocked on you), or "idle" (nothing to report).
-    let state: String
+    var state: String
     let cwd: String
     let branch: String
     let tty: String
@@ -36,6 +36,8 @@ struct Session: Identifiable {
     let message: String
     let started: Date?
     let time: Date
+    /// Background shells still running after its reply, as Claude Code's footer counts them.
+    var shells = 0
 
     var folder: String { URL(fileURLWithPath: cwd).lastPathComponent }
 
@@ -84,6 +86,15 @@ func loadSessions() -> [Session] {
         let (cwd, branch) = place(of: pid)
         sessions.append(Session(id: tty, file: nil, state: "idle", cwd: cwd, branch: branch, tty: tty, task: "",
                                 message: "", started: nil, time: .distantPast))
+    }
+    // A finished or idle session with background shells still running is still working.
+    let quiet = sessions.filter { $0.state == "done" || $0.state == "idle" }.map(\.tty)
+    if !quiet.isEmpty {
+        let shells = Terminal.backgroundShells(on: Set(quiet))
+        for i in sessions.indices where (shells[sessions[i].tty] ?? 0) > 0 && quiet.contains(sessions[i].tty) {
+            sessions[i].shells = shells[sessions[i].tty]!
+            sessions[i].state = "working"
+        }
     }
     // Those needing you first, then working, then done, then idle; within each,
     // the one you prompted most recently first. Ties (such as sessions with no
@@ -142,6 +153,9 @@ func estimate(_ session: Session) -> String {
     case "input": return "Waiting on you since \(ago.localizedString(for: session.time, relativeTo: Date()))"
     case "idle": return session.file == nil ? "No activity since the notifier started" : "Idle"
     default: break
+    }
+    if session.shells > 0 {
+        return "Reply finished · \(session.shells) background shell\(session.shells == 1 ? "" : "s") running"
     }
     guard let started = session.started else { return "Working" }
     let elapsed = Date().timeIntervalSince(started)
@@ -219,6 +233,38 @@ enum Terminal {
                                          background: colors.0, foreground: colors.1)
         }
         return tabs
+    }
+
+    /// For the tabs on `ttys`, how many background shells Claude Code's footer
+    /// says are still running ("· 1 shell", "· 2 shells still running").
+    static func backgroundShells(on ttys: Set<String>) -> [String: Int] {
+        let source = """
+        tell application "Terminal"
+            set out to ""
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if {\(ttys.map { "\"\($0)\"" }.joined(separator: ", "))} contains (tty of t) then
+                        set out to out & (tty of t) & (character id 31) & (contents of (contents of t)) & (character id 30)
+                    end if
+                end repeat
+            end repeat
+            return out
+        end tell
+        """
+        guard let out = run(source) else { return [:] }
+        let pattern = try! NSRegularExpression(pattern: "(\\d+) shells?\\b")
+        var counts: [String: Int] = [:]
+        for item in out.components(separatedBy: record) {
+            let parts = item.components(separatedBy: field)
+            guard parts.count == 2 else { continue }
+            // The status lines are at the bottom of the screen.
+            let bottom = parts[1].components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                .suffix(6).joined(separator: "\n")
+            let range = NSRange(bottom.startIndex..., in: bottom)
+            let found = pattern.matches(in: bottom, range: range).compactMap { Range($0.range(at: 1), in: bottom).flatMap { Int(bottom[$0]) } }
+            if let most = found.max(), most > 0 { counts[parts[0]] = most }
+        }
+        return counts
     }
 
     /// The scrollback of the tab on `tty`, up to its last `lines` lines.
