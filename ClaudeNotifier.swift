@@ -33,11 +33,18 @@ struct Session: Identifiable {
     let branch: String
     let tty: String
     let task: String
-    let message: String
+    var message: String
     let started: Date?
     let time: Date
     /// Background shells still running after its reply, as Claude Code's footer counts them.
     var shells = 0
+    /// When its Claude process started.
+    var opened: Date?
+    /// Whether `id` is a Claude Code session id, so the session can be resumed or copied.
+    var resumable = false
+
+    /// When you last prompted it, or else when it was opened: the order within its status.
+    var recency: Date { started ?? opened ?? .distantPast }
 
     var folder: String { URL(fileURLWithPath: cwd).lastPathComponent }
 
@@ -66,7 +73,7 @@ func loadSessions() -> [Session] {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         let tty = json["tty"] as? String ?? ""
         guard tty.isEmpty || running[tty] != nil else { return nil }
-        return Session(
+        var session = Session(
             id: url.deletingPathExtension().lastPathComponent,
             file: url,
             state: json["state"] as? String ?? "done",
@@ -78,31 +85,44 @@ func loadSessions() -> [Session] {
             started: (json["started"] as? Double).map { Date(timeIntervalSince1970: $0) },
             time: Date(timeIntervalSince1970: json["time"] as? Double ?? 0)
         )
+        session.opened = running[tty]?.opened
+        session.resumable = true
+        return session
     }
     // A terminal can hold a closed session's file and a newer session; keep the newest.
     var seen = Set<String>()
     var sessions = all.sorted { $0.time > $1.time }.filter { $0.tty.isEmpty || seen.insert($0.tty).inserted }
-    for (tty, pid) in running where !seen.contains(tty) {
-        let (cwd, branch) = place(of: pid)
-        sessions.append(Session(id: tty, file: nil, state: "idle", cwd: cwd, branch: branch, tty: tty, task: "",
-                                message: "", started: nil, time: .distantPast))
+    for (tty, process) in running where !seen.contains(tty) {
+        // Claude Code records each running process's session in ~/.claude/sessions/<pid>.json.
+        let record = claudeSessionRecord(pid: process.pid)
+        let (cwd, branch) = record.map { ($0.cwd, gitBranch($0.cwd)) } ?? place(of: process.pid)
+        var session = Session(id: record?.id ?? tty, file: nil, state: "idle", cwd: cwd, branch: branch, tty: tty,
+                              task: "", message: "", started: nil, time: .distantPast,
+                              opened: record?.started ?? process.opened)
+        session.resumable = record != nil
+        sessions.append(session)
     }
-    // A finished or idle session with background shells still running is still working.
-    let quiet = sessions.filter { $0.state == "done" || $0.state == "idle" }.map(\.tty)
-    if !quiet.isEmpty {
-        let shells = Terminal.backgroundShells(on: Set(quiet))
-        for i in sessions.indices where (shells[sessions[i].tty] ?? 0) > 0 && quiet.contains(sessions[i].tty) {
-            sessions[i].shells = shells[sessions[i].tty]!
+    // What the screens show that no hook reports: a question or permission prompt
+    // (such as the ones Claude asks while starting up) needs you; background shells
+    // still running after a reply mean it is still working.
+    let screens = Terminal.screenSignals(on: Set(sessions.map(\.tty).filter { !$0.isEmpty }))
+    for i in sessions.indices {
+        guard let signal = screens[sessions[i].tty] else { continue }
+        if signal.asking && sessions[i].state != "input" {
+            sessions[i].state = "input"
+            if sessions[i].message.isEmpty { sessions[i].message = "is asking you something" }
+        } else if signal.shells > 0 && (sessions[i].state == "done" || sessions[i].state == "idle") {
+            sessions[i].shells = signal.shells
             sessions[i].state = "working"
         }
     }
     // Those needing you first, then working, then done, then idle; within each,
-    // the one you prompted most recently first. Ties (such as sessions with no
-    // prompt seen) go by terminal, so they keep their places between refreshes.
+    // the one you prompted (or, never prompted, opened) most recently first.
+    // Ties go by terminal, so they keep their places between refreshes.
     let rank = ["input": 0, "working": 1, "done": 2]
     return sessions.sorted {
-        (rank[$0.state] ?? 3, -($0.started ?? .distantPast).timeIntervalSince1970, $0.tty, $0.id)
-            < (rank[$1.state] ?? 3, -($1.started ?? .distantPast).timeIntervalSince1970, $1.tty, $1.id)
+        (rank[$0.state] ?? 3, -$0.recency.timeIntervalSince1970, $0.tty, $0.id)
+            < (rank[$1.state] ?? 3, -$1.recency.timeIntervalSince1970, $1.tty, $1.id)
     }
 }
 
@@ -120,16 +140,43 @@ func output(_ tool: String, _ arguments: [String]) -> String {
     return out
 }
 
-/// Running `claude` processes with a terminal: their device (e.g. /dev/ttys003) to their pid.
-func claudeProcesses() -> [String: Int] {
-    var processes: [String: Int] = [:]
-    for line in output("/bin/ps", ["-axo", "pid=,tty=,comm="]).split(separator: "\n") {
-        let parts = line.split(separator: " ", maxSplits: 2)
-        guard parts.count == 3, parts[1] != "??", let pid = Int(parts[0]),
-              parts[2].trimmingCharacters(in: .whitespaces).split(separator: "/").last == "claude" else { continue }
-        processes["/dev/\(parts[1])"] = pid
+/// Running `claude` processes with a terminal, by device (e.g. /dev/ttys003): their pid and when they started.
+func claudeProcesses() -> [String: (pid: Int, opened: Date)] {
+    var processes: [String: (pid: Int, opened: Date)] = [:]
+    for line in output("/bin/ps", ["-axo", "pid=,etime=,tty=,comm="]).split(separator: "\n") {
+        let parts = line.split(separator: " ", maxSplits: 3)
+        guard parts.count == 4, parts[2] != "??", let pid = Int(parts[0]),
+              parts[3].trimmingCharacters(in: .whitespaces).split(separator: "/").last == "claude" else { continue }
+        processes["/dev/\(parts[2])"] = (pid, Date().addingTimeInterval(-elapsed(String(parts[1]))))
     }
     return processes
+}
+
+/// Seconds in a `ps` elapsed time, [[dd-]hh:]mm:ss.
+func elapsed(_ text: String) -> TimeInterval {
+    let dayParts = text.split(separator: "-")
+    let days = dayParts.count == 2 ? Double(dayParts[0]) ?? 0 : 0
+    let clock = (dayParts.last ?? "").split(separator: ":").compactMap { Double($0) }
+    return days * 86400 + clock.reduce(0) { $0 * 60 + $1 }
+}
+
+/// The session id, directory and start time Claude Code records for a running process.
+func claudeSessionRecord(pid: Int) -> (id: String, cwd: String, started: Date?)? {
+    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/sessions/\(pid).json")
+    guard let data = try? Data(contentsOf: url),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let id = json["sessionId"] as? String else { return nil }
+    return (id, json["cwd"] as? String ?? "", (json["startedAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) })
+}
+
+/// The git branch checked out in `dir`, looked up at most every 30 seconds; empty outside a repository.
+var branches: [String: (branch: String, at: Date)] = [:]
+func gitBranch(_ dir: String) -> String {
+    if let known = branches[dir], Date().timeIntervalSince(known.at) < 30 { return known.branch }
+    let branch = dir.isEmpty ? "" : output("/usr/bin/git", ["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    branches[dir] = (branch, Date())
+    return branch
 }
 
 /// A process's working directory and its git branch, cached by pid.
@@ -235,9 +282,11 @@ enum Terminal {
         return tabs
     }
 
-    /// For the tabs on `ttys`, how many background shells Claude Code's footer
-    /// says are still running ("· 1 shell", "· 2 shells still running").
-    static func backgroundShells(on ttys: Set<String>) -> [String: Int] {
+    /// For the tabs on `ttys`, from the bottom of each screen: whether Claude
+    /// Code is showing a question or permission prompt, and how many background
+    /// shells its footer says are still running ("· 1 shell", "· 2 shells still running").
+    static func screenSignals(on ttys: Set<String>) -> [String: (asking: Bool, shells: Int)] {
+        guard !ttys.isEmpty else { return [:] }
         let source = """
         tell application "Terminal"
             set out to ""
@@ -253,18 +302,38 @@ enum Terminal {
         """
         guard let out = run(source) else { return [:] }
         let pattern = try! NSRegularExpression(pattern: "(\\d+) shells?\\b")
-        var counts: [String: Int] = [:]
+        let choice = try! NSRegularExpression(pattern: "^\\s*[❯>] \\d+\\.", options: .anchorsMatchLines)
+        let hints = ["Enter to confirm", "Enter to select", "Esc to cancel", "Esc to exit"]
+        var signals: [String: (asking: Bool, shells: Int)] = [:]
         for item in out.components(separatedBy: record) {
             let parts = item.components(separatedBy: field)
             guard parts.count == 2 else { continue }
             // The status lines are at the bottom of the screen.
-            let bottom = parts[1].components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-                .suffix(6).joined(separator: "\n")
+            let lines = parts[1].components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            let bottom = lines.suffix(6).joined(separator: "\n")
             let range = NSRange(bottom.startIndex..., in: bottom)
             let found = pattern.matches(in: bottom, range: range).compactMap { Range($0.range(at: 1), in: bottom).flatMap { Int(bottom[$0]) } }
-            if let most = found.max(), most > 0 { counts[parts[0]] = most }
+            signals[parts[0]] = (asking(Array(lines.suffix(12)), hints: hints, choice: choice), found.max() ?? 0)
         }
-        return counts
+        return signals
+    }
+
+    /// Whether the bottom `lines` of a screen show a question or permission
+    /// prompt: its choices or key hints, in place of Claude Code's input box (a
+    /// rule, a ❯ line that is not a numbered choice, a rule). Checking for the
+    /// box keeps output that merely quotes the hints from counting.
+    static func asking(_ lines: [String], hints: [String], choice: NSRegularExpression) -> Bool {
+        let trimmed = lines.map { $0.trimmingCharacters(in: .whitespaces) }
+        func isChoice(_ line: String) -> Bool {
+            choice.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
+        }
+        let inputBox = trimmed.indices.contains { i in
+            guard trimmed[i].hasPrefix("──"), let next = trimmed[(i + 1)...].firstIndex(where: { !$0.isEmpty }),
+                  trimmed[next].hasPrefix("❯"), !isChoice(trimmed[next]) else { return false }
+            return trimmed[(next + 1)...].contains { $0.hasPrefix("──") }
+        }
+        if inputBox { return false }
+        return trimmed.suffix(4).contains { line in hints.contains { line.contains($0) } } || trimmed.contains(where: isChoice)
     }
 
     /// The scrollback of the tab on `tty`, up to its last `lines` lines.
@@ -562,7 +631,7 @@ struct NewSessionView: View {
         _source = State(initialValue: source)
     }
 
-    var forkable: [Session] { model.sessions.filter { $0.file != nil } }
+    var forkable: [Session] { model.sessions.filter(\.resumable) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -877,7 +946,7 @@ enum Screenshots {
                      message: String = "", started: TimeInterval? = nil, ago: TimeInterval) -> Session {
             Session(id: "demo-\(tty)", file: URL(fileURLWithPath: "/demo/\(tty).json"), state: state,
                     cwd: home + "/code/\(cwd)", branch: branch, tty: "/dev/\(tty)", task: task, message: message,
-                    started: started.map { now.addingTimeInterval(-$0) }, time: now.addingTimeInterval(-ago))
+                    started: started.map { now.addingTimeInterval(-$0) }, time: now.addingTimeInterval(-ago), resumable: true)
         }
         let sessions = [
             session("ttys001", "input", "weather-app", "feat/radar", "Add a radar overlay to the map view and cache the tiles",

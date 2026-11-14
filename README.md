@@ -43,7 +43,13 @@ prompted first:
 | Needs you | green | blocked on a permission prompt or a question |
 | Working | blue | working on your last prompt |
 | Done | red | finished its reply |
-| Idle | grey | nothing new; or running since before the notifier saw it |
+| Idle | grey | nothing new, or nothing seen since the notifier started |
+
+What a session's screen shows counts too, for things no hook reports: a question
+or permission prompt in place of Claude's input box (such as the ones Claude asks
+while starting up) shows as **Needs you**, and a finished session whose footer
+says background shells are still running shows as **Working**. A session never
+prompted is ordered by when it was opened.
 
 Each card shows the session's task (your last prompt), directory and branch, how
 long it has been working, and a live preview of its screen in that terminal's
@@ -91,8 +97,9 @@ From the dashboard:
 To check the copy really has the context, ask it about something only the
 original conversation contains.
 
-A session appears under **Copy of …** once the notifier has seen it do something
-(it needs the session's id); prompting it once is enough.
+Every Claude session running in Terminal is listed under **Copy of …**: the
+notifier reads each one's session id from Claude Code's record of its running
+processes (`~/.claude/sessions/<pid>.json`).
 
 From the command line:
 
