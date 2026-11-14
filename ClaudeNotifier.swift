@@ -23,7 +23,7 @@ func log(_ message: String) {
 
 // MARK: - Sessions
 
-struct Session: Identifiable {
+struct Session: Identifiable, Equatable {
     /// The session id, or the terminal for a session with no file yet.
     let id: String
     let file: URL?
@@ -62,10 +62,19 @@ struct Session: Identifiable {
     }
 }
 
-/// The session files of open Claude sessions, plus a placeholder for each
-/// running Claude with no file yet. A file whose terminal no longer runs Claude
-/// belongs to a closed session and is skipped.
-func loadSessions() -> [Session] {
+/// Everything one poll learns: the open sessions and Terminal's tabs.
+struct Snapshot: Equatable {
+    var sessions: [Session] = []
+    var tabs: [String: TerminalTab] = [:]
+    /// The Terminal tab you are looking at, if Terminal is in front.
+    var focused: String?
+}
+
+/// One look at everything: the session files of open Claude sessions, plus one
+/// for each running Claude with no file yet, and one read of Terminal's tabs.
+/// A file whose terminal no longer runs Claude belongs to a closed session and
+/// is skipped. Runs off the main thread.
+func takeSnapshot() -> Snapshot {
     let running = claudeProcesses()
     let files = (try? FileManager.default.contentsOfDirectory(at: sessionsDir, includingPropertiesForKeys: nil)) ?? []
     let all: [Session] = files.filter { $0.pathExtension == "json" }.compactMap { url in
@@ -105,9 +114,10 @@ func loadSessions() -> [Session] {
     // What the screens show that no hook reports: a question or permission prompt
     // (such as the ones Claude asks while starting up) needs you; background shells
     // still running after a reply mean it is still working.
-    let screens = Terminal.screenSignals(on: Set(sessions.map(\.tty).filter { !$0.isEmpty }))
+    let (tabs, focused) = Terminal.read(screensOf: Set(running.keys))
     for i in sessions.indices {
-        guard let signal = screens[sessions[i].tty] else { continue }
+        guard let contents = tabs[sessions[i].tty]?.contents else { continue }
+        let signal = Terminal.signals(contents)
         if signal.asking && sessions[i].state != "input" {
             sessions[i].state = "input"
             if sessions[i].message.isEmpty { sessions[i].message = "is asking you something" }
@@ -120,10 +130,11 @@ func loadSessions() -> [Session] {
     // the one you prompted (or, never prompted, opened) most recently first.
     // Ties go by terminal, so they keep their places between refreshes.
     let rank = ["input": 0, "working": 1, "done": 2]
-    return sessions.sorted {
+    sessions.sort {
         (rank[$0.state] ?? 3, -$0.recency.timeIntervalSince1970, $0.tty, $0.id)
             < (rank[$1.state] ?? 3, -$1.recency.timeIntervalSince1970, $1.tty, $1.id)
     }
+    return Snapshot(sessions: sessions, tabs: tabs, focused: focused)
 }
 
 /// Runs `tool` with `arguments` and returns what it prints.
@@ -214,14 +225,18 @@ func estimate(_ session: Session) -> String {
     return "\(ran) · longer than a typical prompt (\(duration(typical)))"
 }
 
-/// How long your recent finished prompts took, in seconds.
+/// How long your recent finished prompts took, in seconds; read at most every 30 seconds.
 var pastDurations: () -> [Double] = {
+    if let cached = durationsCache, Date().timeIntervalSince(cached.at) < 30 { return cached.durations }
     let history = (try? String(contentsOf: notifierDir.appendingPathComponent("history.jsonl"), encoding: .utf8)) ?? ""
-    return history.split(separator: "\n").suffix(50).compactMap { line -> Double? in
+    let durations = history.split(separator: "\n").suffix(50).compactMap { line -> Double? in
         guard let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return nil }
         return json["seconds"] as? Double
     }
+    durationsCache = (durations, Date())
+    return durations
 }
+var durationsCache: (durations: [Double], at: Date)?
 
 func duration(_ seconds: TimeInterval) -> String {
     let s = Int(seconds)
@@ -230,7 +245,7 @@ func duration(_ seconds: TimeInterval) -> String {
 
 // MARK: - Terminal
 
-struct TerminalTab {
+struct TerminalTab: Equatable {
     /// The tab's own title (Claude Code sets the session's), without status symbols.
     let title: String
     /// The whole window title.
@@ -245,30 +260,42 @@ struct TerminalTab {
 enum Terminal {
     static let field = "\u{1F}", record = "\u{1E}"
 
-    /// Each Terminal tab, by its terminal device.
-    static func tabs(withContents: Bool) -> [String: TerminalTab] {
+    /// Each Terminal tab, by its terminal device, with the screens of the tabs on
+    /// `ttys`; and the tab you are looking at, if Terminal is in front. One request
+    /// to Terminal, made off the main thread.
+    static func read(screensOf ttys: Set<String>) -> (tabs: [String: TerminalTab], focused: String?) {
+        let wanted = ttys.map { "\"\($0)\"" }.joined(separator: ", ")
         let source = """
         tell application "Terminal"
             set out to ""
+            try
+                if frontmost then set out to tty of selected tab of front window
+            end try
+            set out to out & (character id 30)
+            set wanted to {\(wanted)}
             repeat with w in windows
-                repeat with t in tabs of w
-                    set n to ""
-                    if title displays custom title of t then set n to custom title of t
-                    set c to ""
-                    -- On a loop variable, `contents of` alone dereferences it and returns the tab.
-                    if \(withContents) then set c to contents of (contents of t)
-                    set b to background color of t
-                    set f to normal text color of t
-                    set rgb to "" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 1 of f) & "," & (item 2 of f) & "," & (item 3 of f)
-                    set out to out & (tty of t) & (character id 31) & n & (character id 31) & (name of w) & (character id 31) & rgb & (character id 31) & c & (character id 30)
-                end repeat
+                try
+                    repeat with t in tabs of w
+                        set n to ""
+                        if title displays custom title of t then set n to custom title of t
+                        set c to ""
+                        -- On a loop variable, `contents of` alone dereferences it and returns the tab.
+                        if wanted contains (tty of t) then set c to contents of (contents of t)
+                        set b to background color of t
+                        set f to normal text color of t
+                        set rgb to "" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 1 of f) & "," & (item 2 of f) & "," & (item 3 of f)
+                        set out to out & (tty of t) & (character id 31) & n & (character id 31) & (name of w) & (character id 31) & rgb & (character id 31) & c & (character id 30)
+                    end repeat
+                end try
             end repeat
             return out
         end tell
         """
-        guard let out = run(source) else { return [:] }
+        guard let out = runInBackground(source) else { return ([:], nil) }
+        var items = out.components(separatedBy: record)
+        let focused = items.isEmpty ? "" : items.removeFirst()
         var tabs: [String: TerminalTab] = [:]
-        for item in out.components(separatedBy: record) {
+        for item in items {
             let parts = item.components(separatedBy: field)
             guard parts.count == 5 else { continue }
             // Terminal's colour components run from 0 to 65535.
@@ -279,43 +306,23 @@ enum Terminal {
             tabs[parts[0]] = TerminalTab(title: clean(parts[1]), window: clean(parts[2]), contents: parts[4],
                                          background: colors.0, foreground: colors.1)
         }
-        return tabs
+        return (tabs, focused.isEmpty ? nil : focused)
     }
 
-    /// For the tabs on `ttys`, from the bottom of each screen: whether Claude
-    /// Code is showing a question or permission prompt, and how many background
-    /// shells its footer says are still running ("· 1 shell", "· 2 shells still running").
-    static func screenSignals(on ttys: Set<String>) -> [String: (asking: Bool, shells: Int)] {
-        guard !ttys.isEmpty else { return [:] }
-        let source = """
-        tell application "Terminal"
-            set out to ""
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if {\(ttys.map { "\"\($0)\"" }.joined(separator: ", "))} contains (tty of t) then
-                        set out to out & (tty of t) & (character id 31) & (contents of (contents of t)) & (character id 30)
-                    end if
-                end repeat
-            end repeat
-            return out
-        end tell
-        """
-        guard let out = run(source) else { return [:] }
-        let pattern = try! NSRegularExpression(pattern: "(\\d+) shells?\\b")
-        let choice = try! NSRegularExpression(pattern: "^\\s*[❯>] \\d+\\.", options: .anchorsMatchLines)
-        let hints = ["Enter to confirm", "Enter to select", "Esc to cancel", "Esc to exit"]
-        var signals: [String: (asking: Bool, shells: Int)] = [:]
-        for item in out.components(separatedBy: record) {
-            let parts = item.components(separatedBy: field)
-            guard parts.count == 2 else { continue }
-            // The status lines are at the bottom of the screen.
-            let lines = parts[1].components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-            let bottom = lines.suffix(6).joined(separator: "\n")
-            let range = NSRange(bottom.startIndex..., in: bottom)
-            let found = pattern.matches(in: bottom, range: range).compactMap { Range($0.range(at: 1), in: bottom).flatMap { Int(bottom[$0]) } }
-            signals[parts[0]] = (asking(Array(lines.suffix(12)), hints: hints, choice: choice), found.max() ?? 0)
-        }
-        return signals
+    static let shellCount = try! NSRegularExpression(pattern: "(\\d+) shells?\\b")
+    static let choice = try! NSRegularExpression(pattern: "^\\s*[❯>] \\d+\\.", options: .anchorsMatchLines)
+    static let hints = ["Enter to confirm", "Enter to select", "Esc to cancel", "Esc to exit"]
+
+    /// From the bottom of a screen: whether Claude Code is showing a question or
+    /// permission prompt, and how many background shells its footer says are
+    /// still running ("· 1 shell", "· 2 shells still running").
+    static func signals(_ contents: String) -> (asking: Bool, shells: Int) {
+        let lines = contents.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        // The status lines are at the bottom of the screen.
+        let bottom = lines.suffix(6).joined(separator: "\n")
+        let found = shellCount.matches(in: bottom, range: NSRange(bottom.startIndex..., in: bottom))
+            .compactMap { Range($0.range(at: 1), in: bottom).flatMap { Int(bottom[$0]) } }
+        return (asking(Array(lines.suffix(12)), hints: hints, choice: choice), found.max() ?? 0)
     }
 
     /// Whether the bottom `lines` of a screen show a question or permission
@@ -336,7 +343,7 @@ enum Terminal {
         return trimmed.suffix(4).contains { line in hints.contains { line.contains($0) } } || trimmed.contains(where: isChoice)
     }
 
-    /// The scrollback of the tab on `tty`, up to its last `lines` lines.
+    /// The scrollback of the tab on `tty`, up to its last `lines` lines. Off the main thread.
     static func history(tty: String, lines: Int) -> String {
         let source = """
         tell application "Terminal"
@@ -348,7 +355,7 @@ enum Terminal {
             return ""
         end tell
         """
-        return tail(run(source) ?? "", lines)
+        return tail(runInBackground(source) ?? "", lines)
     }
 
     /// Raises the window whose tab is on `tty` and selects that tab; just
@@ -389,10 +396,38 @@ enum Terminal {
         """)
     }
 
-    /// The selected tab of Terminal's front window, if Terminal is the app in front.
-    static func focusedTab() -> String? {
-        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal" else { return nil }
-        return run("tell application \"Terminal\" to get tty of selected tab of front window")
+    /// Exits the Claude session on `session.tty` (SIGTERM, as closing its
+    /// window would), then closes the window once only its shell is left. A
+    /// window with other tabs, or still running something else, stays open.
+    static func close(_ session: Session) {
+        guard let pid = claudeProcesses()[session.tty]?.pid else { return }
+        kill(pid_t(pid), SIGTERM)
+        DispatchQueue.global().async {
+            for _ in 0..<50 where kill(pid_t(pid), 0) == 0 { usleep(100_000) }
+            let exited = kill(pid_t(pid), 0) != 0
+            DispatchQueue.main.async {
+                guard exited else {
+                    log("Claude Notifier: Claude (pid \(pid)) on \(session.tty) did not exit within 5 seconds")
+                    return
+                }
+                if let file = session.file { try? FileManager.default.removeItem(at: file) }
+                // Let the shell take over the tab before checking it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    _ = run("""
+                    tell application "Terminal"
+                        repeat with w in windows
+                            repeat with t in tabs of w
+                                if tty of t is "\(session.tty)" then
+                                    if (count of tabs of w) is 1 and not (busy of t) then close w
+                                    return
+                                end if
+                            end repeat
+                        end repeat
+                    end tell
+                    """)
+                }
+            }
+        }
     }
 
     /// Opens a Popcorn Terminal window (a random theme) in `dir`, running
@@ -403,6 +438,32 @@ enum Terminal {
         process.arguments = [dir] + (command.map { [$0] } ?? [])
         process.standardOutput = FileHandle.nullDevice
         do { try process.run() } catch { log("Claude Notifier: could not open a Popcorn terminal: \(error)") }
+    }
+
+    /// Runs AppleScript through osascript, which is safe off the main thread
+    /// (NSAppleScript is not). For the polls; actions you take use `run`.
+    static func runInBackground(_ source: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-"]
+        let input = Pipe(), output = Pipe(), errors = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = errors
+        guard (try? process.run()) != nil else { return nil }
+        input.fileHandleForWriting.write(Data(source.utf8))
+        try? input.fileHandleForWriting.close()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let failure = errors.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            log("Claude Notifier: AppleScript failed: \(String(decoding: failure, as: UTF8.self))")
+            return nil
+        }
+        // osascript ends what it prints with a newline.
+        var text = String(decoding: data, as: UTF8.self)
+        if text.hasSuffix("\n") { text.removeLast() }
+        return text
     }
 
     static func run(_ source: String) -> String? {
@@ -443,32 +504,38 @@ final class DashboardModel: ObservableObject {
     @Published var sessions: [Session] = []
     @Published var tabs: [String: TerminalTab] = [:]
     @Published var selected: Session?
+    /// The selected session's scrollback, fetched in the background every few seconds.
     @Published var detail = ""
-    private var timer: Timer?
+    /// The session you asked to close, awaiting your confirmation.
+    @Published var closing: Session?
+    /// Whether the dashboard is open, so polls update it.
+    var visible = false
+    private var fetching = false
 
-    func start() {
-        refresh()
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
-    }
-
-    func stop() {
-        timer?.invalidate()
-        timer = nil
-    }
-
-    func refresh() {
-        sessions = loadSessions()
-        tabs = Terminal.tabs(withContents: true)
-        if let selected {
-            self.selected = sessions.first { $0.id == selected.id } ?? selected
-            detail = Terminal.history(tty: selected.tty, lines: 400)
-        }
+    /// Takes in a poll's results, publishing only what changed, so views redraw only then.
+    func apply(_ snapshot: Snapshot) {
+        if sessions != snapshot.sessions { sessions = snapshot.sessions }
+        if tabs != snapshot.tabs { tabs = snapshot.tabs }
+        if let selected, let now = sessions.first(where: { $0.id == selected.id }), now != selected { self.selected = now }
     }
 
     func open(_ session: Session) {
         selected = session
-        detail = Terminal.history(tty: session.tty, lines: 400)
+        detail = ""
+        fetchDetail()
+    }
+
+    /// Fetches the selected session's scrollback off the main thread.
+    func fetchDetail() {
+        guard let session = selected, !fetching else { return }
+        fetching = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let history = Terminal.history(tty: session.tty, lines: 400)
+            DispatchQueue.main.async {
+                self.fetching = false
+                if self.selected?.id == session.id, self.detail != history { self.detail = history }
+            }
+        }
     }
 }
 
@@ -493,6 +560,31 @@ struct StatusPill: View {
             .padding(.vertical, 3)
             .background(Capsule().fill(color.opacity(0.18)))
             .foregroundStyle(color)
+    }
+}
+
+/// What closing `session` does, for the confirmation.
+func closeMessage(_ session: Session) -> String {
+    let what = session.cwd.isEmpty ? "this window" : "\(session.folder) (\(session.place))"
+    var text = "Claude in \(what) will exit, and its Terminal window will close."
+    if session.state == "working" { text += " It is working: that work stops." }
+    if session.resumable { text += "\n\nThe conversation is kept. Resume it with:\nclaude --resume \(session.id)" }
+    return text
+}
+
+/// The badge on a card counted in the menu bar: red for finished, green for needs you.
+struct NotificationDot: View {
+    let state: String
+
+    var body: some View {
+        if state == "done" || state == "input" {
+            Circle()
+                .fill(state == "done" ? Color.red : Color.green)
+                .frame(width: 16, height: 16)
+                .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 2.5))
+                .shadow(color: .black.opacity(0.25), radius: 1.5, y: 1)
+                .help(state == "done" ? "Finished: counted in the menu bar's red number" : "Needs you: counted in the menu bar's green number")
+        }
     }
 }
 
@@ -526,6 +618,7 @@ struct SessionCard: View {
     /// The card's size; its preview takes whatever height is left.
     let size: CGSize
     let open: () -> Void
+    var close: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -535,6 +628,9 @@ struct SessionCard: View {
                 Spacer()
                 Button("Bring to front") { Terminal.focus(tty: session.tty) }
                     .controlSize(.small)
+                Button("Close…", role: .destructive) { close() }
+                    .controlSize(.small)
+                    .help("Exit Claude in this window and close it, after you confirm")
             }
             if !session.cwd.isEmpty {
                 Text(session.place).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -555,6 +651,7 @@ struct SessionCard: View {
         .frame(width: size.width, height: size.height, alignment: .top)
         .background(RoundedRectangle(cornerRadius: 10).fill(status(session.state).color.opacity(0.12)))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(status(session.state).color.opacity(0.35)))
+        .overlay(alignment: .topTrailing) { NotificationDot(state: session.state).offset(x: 6, y: -6) }
         .contentShape(Rectangle())
         .onTapGesture(perform: open)
         .help("Click for a larger view")
@@ -582,6 +679,8 @@ struct DetailView: View {
                     .help(session.cwd.isEmpty ? "This session's directory is unknown" : "A plain shell in \(session.path)")
                 Button("Bring to front") { Terminal.focus(tty: session.tty) }
                     .keyboardShortcut(.defaultAction)
+                Button("Close…", role: .destructive) { model.closing = session }
+                    .help("Exit Claude in this window and close it, after you confirm")
             }
             HStack {
                 StatusPill(state: session.state)
@@ -591,7 +690,9 @@ struct DetailView: View {
             if !session.task.isEmpty { Text(session.task).font(.callout).lineLimit(4) }
             if session.state == "input" { Text(session.message).foregroundStyle(.green) }
             Text(estimate(session)).font(.caption).foregroundStyle(.secondary)
-            TerminalText(text: model.detail, size: 11, tab: model.tabs[session.tty])
+            // The live screen stands in until the scrollback arrives.
+            TerminalText(text: model.detail.isEmpty ? Terminal.tail(model.tabs[session.tty]?.contents ?? "", 400) : model.detail,
+                         size: 11, tab: model.tabs[session.tty])
             HStack(alignment: .bottom) {
                 TextField("Type a prompt for this session…", text: $prompt, axis: .vertical)
                     .lineLimit(1...5)
@@ -700,6 +801,20 @@ struct DashboardView: View {
 
     var body: some View {
         content.frame(minWidth: 520, maxWidth: .infinity, minHeight: 400, maxHeight: .infinity)
+            .alert(
+                "Close this Claude session?",
+                isPresented: Binding(get: { model.closing != nil }, set: { if !$0 { model.closing = nil } }),
+                presenting: model.closing
+            ) { session in
+                Button("Close session", role: .destructive) {
+                    if model.selected?.id == session.id { model.selected = nil }
+                    Terminal.close(session)
+                    model.closing = nil
+                }
+                Button("Cancel", role: .cancel) { model.closing = nil }
+            } message: { session in
+                Text(closeMessage(session))
+            }
     }
 
     @State private var creating = false
@@ -730,7 +845,8 @@ struct DashboardView: View {
                     spacing: GridLayout.spacing
                 ) {
                     ForEach(model.sessions) { session in
-                        SessionCard(session: session, tabs: model.tabs, size: layout.card) { model.open(session) }
+                        SessionCard(session: session, tabs: model.tabs, size: layout.card,
+                                    open: { model.open(session) }, close: { model.closing = session })
                     }
                 }
                 .padding(GridLayout.spacing)
@@ -787,25 +903,33 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
     let dashboard = DashboardModel()
     var window: NSWindow?
     var timer: Timer?
-    /// The Terminal tab you are looking at, if Terminal is in front.
-    var focused: String?
+    /// The latest poll's results, which the menu bar, its menu and the dashboard all show.
+    var snapshot = Snapshot()
+    /// Polls run one at a time, off the main thread.
+    let pollQueue = DispatchQueue(label: "claude-notifier.poll", qos: .utility)
+    var polling = false
+    var polls = 0
+    /// Whether a poll has finished yet; the first only records which tab is in front.
+    var primed = false
+    /// You clicked while Terminal was in front: the next poll clears what you clicked in.
+    var clicked = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
-        refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
-        focused = Terminal.focusedTab()
+        updateTitle()
+        poll()
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.poll() }
         // A click in a Terminal window you are already looking at also counts
         // as seeing it. Watching clicks in other apps needs Accessibility access.
         AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal" else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                guard let self, let tty = Terminal.focusedTab() else { return }
-                self.focused = tty
-                self.seen(tty)
+                self?.clicked = true
+                self?.poll()
             }
         }
         // Lets a script open the dashboard too.
@@ -813,15 +937,39 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
             self, selector: #selector(openDashboard), name: Notification.Name("com.cheyenne.claude-notifier.open"), object: nil)
     }
 
-    func refresh() {
+    /// Starts a poll in the background, unless one is running.
+    func poll() {
+        guard !polling else { return }
+        polling = true
+        pollQueue.async {
+            let snapshot = takeSnapshot()
+            DispatchQueue.main.async {
+                self.polling = false
+                self.update(snapshot)
+            }
+        }
+    }
+
+    func update(_ new: Snapshot) {
+        let previous = snapshot.focused
+        snapshot = new
         // Switching to a finished session's tab clears it; one already in front
         // when it finished stays until you click in it.
-        let now = Terminal.focusedTab()
-        if let now, now != focused { seen(now) }
-        focused = now
-        let sessions = loadSessions()
-        let done = sessions.filter { $0.state == "done" }.count
-        let waiting = sessions.filter { $0.state == "input" }.count
+        if primed, let focused = new.focused, focused != previous || clicked { seen(focused) }
+        primed = true
+        clicked = false
+        updateTitle()
+        if dashboard.visible {
+            dashboard.apply(snapshot)
+            // The scrollback is costly to fetch; every third poll is enough.
+            polls += 1
+            if polls % 3 == 0 { dashboard.fetchDetail() }
+        }
+    }
+
+    func updateTitle() {
+        let done = snapshot.sessions.filter { $0.state == "done" }.count
+        let waiting = snapshot.sessions.filter { $0.state == "input" }.count
         let title = NSMutableAttributedString(string: "✳︎ Claude", attributes: [.font: NSFont.menuBarFont(ofSize: 0)])
         for (count, color) in [(done, NSColor.systemRed), (waiting, NSColor.systemGreen)] where count > 0 {
             title.append(NSAttributedString(string: " ● \(count)", attributes: [
@@ -829,12 +977,13 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
                 .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
             ]))
         }
-        item.button?.attributedTitle = title
+        if item.button?.attributedTitle != title { item.button?.attributedTitle = title }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let list = loadSessions().filter { $0.state == "done" || $0.state == "input" }
+        let list = snapshot.sessions.filter { $0.state == "done" || $0.state == "input" }
+        let tabs = snapshot.tabs
         let inputs = list.filter { $0.state == "input" }.count
         let header = NSMenuItem(title: "Claude Notifier — \(list.count - inputs) done, \(inputs) need you", action: nil, keyEquivalent: "")
         header.isEnabled = false
@@ -844,7 +993,6 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         menu.addItem(open)
         menu.addItem(.separator())
         let ago = RelativeDateTimeFormatter()
-        let tabs = list.isEmpty ? [:] : Terminal.tabs(withContents: false)
         for session in list {
             let input = session.state == "input"
             let what = input ? (session.message.isEmpty ? "needs you" : session.message) : "done"
@@ -873,22 +1021,15 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         guard let session = sender.representedObject as? Session else { return }
         if session.state == "done" { markIdle(session) }
         Terminal.focus(tty: session.tty)
-        refresh()
     }
 
     @objc func clearAll() {
-        for session in loadSessions() where session.state == "done" || session.state == "input" { markIdle(session) }
-        refresh()
+        for session in snapshot.sessions where session.state == "done" || session.state == "input" { markIdle(session) }
     }
 
     /// Clears the finished session on `tty`, which you are now looking at.
     func seen(_ tty: String) {
-        var cleared = false
-        for session in loadSessions() where session.tty == tty && session.state == "done" {
-            markIdle(session)
-            cleared = true
-        }
-        if cleared { refresh() }
+        for session in snapshot.sessions where session.tty == tty && session.state == "done" { markIdle(session) }
     }
 
     /// Keeps the session's file, so the dashboard still shows its task, but drops it from the counts.
@@ -897,6 +1038,12 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         json["state"] = "idle"
         if let out = try? JSONSerialization.data(withJSONObject: json) { try? out.write(to: url) }
+        // Show it now rather than at the next poll.
+        if let i = snapshot.sessions.firstIndex(where: { $0.id == session.id }) {
+            snapshot.sessions[i].state = "idle"
+            updateTitle()
+            if dashboard.visible { dashboard.apply(snapshot) }
+        }
     }
 
     @objc func openDashboard() {
@@ -922,13 +1069,15 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
             window.setFrameAutosaveName("ClaudeNotifierDashboardFrame")
             self.window = window
         }
-        dashboard.start()
+        dashboard.visible = true
+        dashboard.apply(snapshot)
+        poll()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
     }
 
     func windowWillClose(_ notification: Notification) {
-        dashboard.stop()
+        dashboard.visible = false
         dashboard.selected = nil
     }
 }

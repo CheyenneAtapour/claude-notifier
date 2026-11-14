@@ -53,8 +53,9 @@ prompted is ordered by when it was opened.
 
 Each card shows the session's task (your last prompt), directory and branch, how
 long it has been working, and a live preview of its screen in that terminal's
-own colours, without Claude's input box. The cards are sized so they all fit in
-the window.
+own colours, without Claude's input box. A card counted in the menu bar's
+number carries a dot in its corner, red or green to match. The cards are sized
+so they all fit in the window.
 
 The **rough ETA** compares how long the session has been working with how long
 your recent prompts took. Claude Code reports no progress, so treat it as a
@@ -74,7 +75,11 @@ From here you can:
   busy, Claude queues it. Line breaks become spaces, since each would submit on
   its own;
 - **New Popcorn terminal here** — open a plain shell in the session's directory
-  (see [Popcorn windows](#popcorn-windows)).
+  (see [Popcorn windows](#popcorn-windows));
+- **Close…** — exit Claude in that window and close it, after you confirm. The
+  conversation is kept, and the confirmation shows the `claude --resume` command
+  to reopen it. A window with other tabs, or still running something else, stays
+  open. Cards have **Close…** too.
 
 ## Start a session with another session's context
 
