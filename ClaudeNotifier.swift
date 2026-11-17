@@ -7,6 +7,7 @@ import SwiftUI
 
 let notifierDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/notifier")
 let sessionsDir = notifierDir.appendingPathComponent("sessions")
+let labelsFile = notifierDir.appendingPathComponent("labels.json")
 
 /// Appends `message` to ~/.claude/notifier/notifier.log.
 func log(_ message: String) {
@@ -500,6 +501,14 @@ enum Terminal {
 
 // MARK: - Dashboard
 
+/// A label you gave a session, with its terminal and when its Claude started, to carry it over to the
+/// session that replaces it in that same Claude.
+struct SessionLabel: Codable, Equatable {
+    var text: String
+    var tty: String
+    var opened: Double?
+}
+
 final class DashboardModel: ObservableObject {
     @Published var sessions: [Session] = []
     @Published var tabs: [String: TerminalTab] = [:]
@@ -508,13 +517,56 @@ final class DashboardModel: ObservableObject {
     @Published var detail = ""
     /// The session you asked to close, awaiting your confirmation.
     @Published var closing: Session?
+    /// Your labels for sessions, by session id; shown on the dashboard only.
+    @Published var labels: [String: SessionLabel] = DashboardModel.loadLabels()
     /// Whether the dashboard is open, so polls update it.
     var visible = false
     private var fetching = false
 
+    func label(_ session: Session) -> String { labels[session.id]?.text ?? "" }
+
+    /// Sets or (when blank) removes a session's label, and saves them all.
+    func setLabel(_ text: String, for session: Session) {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        labels[session.id] = text.isEmpty ? nil
+            : SessionLabel(text: text, tty: session.tty, opened: session.opened?.timeIntervalSince1970)
+        saveLabels()
+    }
+
+    /// A session that starts afresh in the same Claude (after /clear, say) gets a new id;
+    /// it keeps the label of the one it replaced, found by its terminal and Claude process.
+    private func carryLabels() {
+        var changed = false
+        for session in sessions where labels[session.id] == nil {
+            guard let opened = session.opened?.timeIntervalSince1970,
+                  let (old, label) = labels.first(where: { id, label in
+                      label.tty == session.tty && abs((label.opened ?? 0) - opened) < 2
+                          && !sessions.contains { $0.id == id }
+                  }) else { continue }
+            labels[session.id] = label
+            labels[old] = nil
+            changed = true
+        }
+        if changed { saveLabels() }
+    }
+
+    private static func loadLabels() -> [String: SessionLabel] {
+        guard let data = try? Data(contentsOf: labelsFile) else { return [:] }
+        return (try? JSONDecoder().decode([String: SessionLabel].self, from: data)) ?? [:]
+    }
+
+    private func saveLabels() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? encoder.encode(labels).write(to: labelsFile, options: .atomic)
+    }
+
     /// Takes in a poll's results, publishing only what changed, so views redraw only then.
     func apply(_ snapshot: Snapshot) {
-        if sessions != snapshot.sessions { sessions = snapshot.sessions }
+        if sessions != snapshot.sessions {
+            sessions = snapshot.sessions
+            carryLabels()
+        }
         if tabs != snapshot.tabs { tabs = snapshot.tabs }
         if let selected, let now = sessions.first(where: { $0.id == selected.id }), now != selected { self.selected = now }
     }
@@ -560,6 +612,22 @@ struct StatusPill: View {
             .padding(.vertical, 3)
             .background(Capsule().fill(color.opacity(0.18)))
             .foregroundStyle(color)
+    }
+}
+
+/// Your label for a session, as a tag beside its window's name.
+struct LabelTag: View {
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: "tag.fill")
+            .font(.caption.bold())
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color.purple.opacity(0.15)))
+            .foregroundStyle(.purple)
+            .fixedSize()
     }
 }
 
@@ -615,6 +683,7 @@ struct TerminalText: View {
 struct SessionCard: View {
     let session: Session
     let tabs: [String: TerminalTab]
+    var label = ""
     /// The card's size; its preview takes whatever height is left.
     let size: CGSize
     let open: () -> Void
@@ -632,8 +701,11 @@ struct SessionCard: View {
                     .controlSize(.small)
                     .help("Exit Claude in this window and close it, after you confirm")
             }
-            if !session.cwd.isEmpty {
-                Text(session.place).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            if !label.isEmpty || !session.cwd.isEmpty {
+                HStack(spacing: 6) {
+                    if !label.isEmpty { LabelTag(text: label) }
+                    Text(session.place).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
             }
             Text(session.task.isEmpty ? "No prompt seen yet" : session.task)
                 .font(.callout).lineLimit(2)
@@ -662,11 +734,13 @@ struct DetailView: View {
     @ObservedObject var model: DashboardModel
     let session: Session
     @State private var prompt: String
+    @State private var label: String
 
     init(model: DashboardModel, session: Session, prompt: String = "") {
         self.model = model
         self.session = session
         _prompt = State(initialValue: prompt)
+        _label = State(initialValue: model.label(session))
     }
 
     var body: some View {
@@ -685,7 +759,16 @@ struct DetailView: View {
             HStack {
                 StatusPill(state: session.state)
                 Text(session.name(model.tabs)).font(.title3.bold()).lineLimit(1)
+                if !label.trimmingCharacters(in: .whitespaces).isEmpty { LabelTag(text: label.trimmingCharacters(in: .whitespaces)) }
             }
+            HStack {
+                Text("Label").foregroundStyle(.secondary)
+                TextField("Label", text: $label, prompt: Text("Name this session on the dashboard…"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 360)
+                    .onChange(of: label) { _, new in model.setLabel(new, for: session) }
+            }
+            .help("Shown on its card in this dashboard; kept until you clear it")
             if !session.cwd.isEmpty { Text(session.place).font(.callout).foregroundStyle(.secondary) }
             if !session.task.isEmpty { Text(session.task).font(.callout).lineLimit(4) }
             if session.state == "input" { Text(session.message).foregroundStyle(.green) }
@@ -822,6 +905,7 @@ struct DashboardView: View {
     @ViewBuilder var content: some View {
         if let session = model.selected {
             DetailView(model: model, session: session)
+                .id(session.id)
         } else {
             VStack(spacing: 0) {
                 HStack {
@@ -845,7 +929,7 @@ struct DashboardView: View {
                     spacing: GridLayout.spacing
                 ) {
                     ForEach(model.sessions) { session in
-                        SessionCard(session: session, tabs: model.tabs, size: layout.card,
+                        SessionCard(session: session, tabs: model.tabs, label: model.label(session), size: layout.card,
                                     open: { model.open(session) }, close: { model.closing = session })
                     }
                 }
@@ -1177,6 +1261,7 @@ enum Screenshots {
         pastDurations = { [300, 420, 540, 600, 720] }
         let (sessions, tabs) = demo()
         let model = DashboardModel()
+        model.labels = [sessions[1].id: SessionLabel(text: "Rate limiter", tty: sessions[1].tty)]
         model.sessions = sessions
         model.tabs = tabs
         save(DashboardView(model: model), title: "Claude Sessions", size: NSSize(width: 980, height: 720),

@@ -69,6 +69,10 @@ Click a card for a larger, live view of the session's scrollback.
 
 From here you can:
 
+- **label it** — type a name in the **Label** field, say "Rate limiter". It shows
+  as a tag under the window's name on its card, and beside it here, and nowhere outside
+  the dashboard. It is kept until you clear it: after restarts, when you
+  resume the session, and after `/clear` in the same window;
 - **Bring to front** — focus the session's Terminal tab;
 - **send it a prompt** — type in the box at the bottom and press Send (or ⌘↩).
   It is typed into the session as if you had typed it there; if the session is
