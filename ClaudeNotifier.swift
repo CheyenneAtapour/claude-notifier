@@ -3,6 +3,8 @@
 // open Claude session. Sessions are files in ~/.claude/notifier/sessions,
 // written by hook.sh.
 import AppKit
+import Network
+import Security
 import SwiftUI
 
 let notifierDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/notifier")
@@ -997,6 +999,9 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
     var primed = false
     /// You clicked while Terminal was in front: the next poll clears what you clicked in.
     var clicked = false
+    /// Phone access, off until you turn it on from the menu.
+    let remote = RemoteServer(webDir: Bundle.main.resourceURL?.appendingPathComponent("web")
+        ?? URL(fileURLWithPath: "web"))
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
@@ -1016,6 +1021,8 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
                 self?.poll()
             }
         }
+        remote.perform = { [weak self] action in self?.perform(action) }
+        if remote.config.enabled { remote.start() }
         // Lets a script open the dashboard too.
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(openDashboard), name: Notification.Name("com.cheyenne.claude-notifier.open"), object: nil)
@@ -1049,6 +1056,30 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
             polls += 1
             if polls % 3 == 0 { dashboard.fetchDetail() }
         }
+        publishRemote()
+    }
+
+    /// Sends the phone the latest state, if phone access is on.
+    func publishRemote() {
+        guard remote.running else { return }
+        // Labels carry over to a session's successor in apply, which the phone needs too.
+        if !dashboard.visible { dashboard.apply(snapshot) }
+        remote.publish(snapshot.sessions, tabs: snapshot.tabs, labels: dashboard.labels)
+    }
+
+    /// Does what the phone asked.
+    func perform(_ action: RemoteAction) {
+        switch action {
+        case .prompt(let session, let text): Terminal.send(text, to: session.tty)
+        case .focus(let session): Terminal.focus(tty: session.tty)
+        case .close(let session): Terminal.close(session)
+        case .label(let session, let text): dashboard.setLabel(text, for: session)
+        case .seen(let session): if session.state == "done" { markIdle(session) }
+        case .start(let directory, let source):
+            Terminal.popcorn(in: directory, running: source.map { "claude --resume \($0) --fork-session" } ?? "claude")
+        }
+        publishRemote()
+        poll()
     }
 
     func updateTitle() {
@@ -1097,8 +1128,53 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
             menu.addItem(clear)
         }
         menu.addItem(.separator())
+        menu.addItem(phoneMenu())
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Claude Notifier", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
+
+    /// Phone Access: turn it on or off, and what to open on the phone.
+    func phoneMenu() -> NSMenuItem {
+        let item = NSMenuItem(title: "Phone Access", action: nil, keyEquivalent: "")
+        let menu = NSMenu()
+        let toggle = NSMenuItem(title: "Allow Phone Access", action: #selector(togglePhone), keyEquivalent: "")
+        toggle.target = self
+        toggle.state = remote.running ? .on : .off
+        menu.addItem(toggle)
+        if remote.running {
+            menu.addItem(.separator())
+            let addresses = remote.addresses
+            let info = addresses.isEmpty ? ["Not on a network"] : addresses.map { "Open \($0) on your phone" }
+            for line in info + ["Access code: \(remote.config.code)"] {
+                let row = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+                row.isEnabled = false
+                menu.addItem(row)
+            }
+            let copy = NSMenuItem(title: "Copy Address", action: #selector(copyPhoneAddress), keyEquivalent: "")
+            copy.target = self
+            copy.isEnabled = !addresses.isEmpty
+            menu.addItem(copy)
+            menu.addItem(.separator())
+            let code = NSMenuItem(title: "New Access Code (signs the phone out)", action: #selector(newPhoneCode), keyEquivalent: "")
+            code.target = self
+            menu.addItem(code)
+        }
+        item.submenu = menu
+        return item
+    }
+
+    @objc func togglePhone() {
+        remote.setEnabled(!remote.running)
+        publishRemote()
+    }
+
+    @objc func copyPhoneAddress() {
+        guard let address = remote.addresses.first else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(address, forType: .string)
+    }
+
+    @objc func newPhoneCode() { remote.newCode() }
 
     /// Dismissing a finished session marks it idle; one blocked on you stays until it resumes.
     @objc func dismiss(_ sender: NSMenuItem) {
@@ -1127,6 +1203,7 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
             snapshot.sessions[i].state = "idle"
             updateTitle()
             if dashboard.visible { dashboard.apply(snapshot) }
+            publishRemote()
         }
     }
 
@@ -1163,6 +1240,386 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
     func windowWillClose(_ notification: Notification) {
         dashboard.visible = false
         dashboard.selected = nil
+    }
+}
+
+// MARK: - Phone access
+
+/// What the phone asks the Mac to do. The server hands these to the main thread.
+enum RemoteAction {
+    case prompt(Session, String)
+    case focus(Session)
+    case close(Session)
+    case label(Session, String)
+    case seen(Session)
+    case start(directory: String, source: String?)
+}
+
+/// Phone access: a small web server for the phone's dashboard (web/index.html), off until you turn it
+/// on from the menu. It answers only devices on your own networks (private addresses: your Wi-Fi,
+/// Tailscale), and only after the access code: a right code sets a cookie, too many wrong ones lock it
+/// for a minute. Everything here runs on its own queue; actions go to the main thread.
+final class RemoteServer {
+    struct Config: Codable {
+        var enabled = false
+        var port: UInt16 = 7878
+        var code = ""
+        var token = ""
+    }
+
+    static let file = notifierDir.appendingPathComponent("remote.json")
+    private(set) var config: Config
+    var running: Bool { listener != nil }
+    /// Where the page's files are: the app's Resources/web, or the repo's web/ when testing.
+    let webDir: URL
+    /// Carries out what the phone asks, on the main thread.
+    var perform: (RemoteAction) -> Void = { _ in }
+    /// A session's scrollback; run off the main thread.
+    var history: (Session) -> String = { Terminal.history(tty: $0.tty, lines: 400) }
+    /// Only for the demo: answer on this computer alone.
+    var localOnly = false
+
+    private var listener: NWListener?
+    private let queue = DispatchQueue(label: "claude-notifier.remote")
+    // On `queue`: the latest state for the phone, its version, the sessions it was made from,
+    // the phone's requests waiting for a change, and recent wrong codes.
+    private var state = Data()
+    private var version = 0
+    private var sessions: [Session] = []
+    private var waiting: [(connection: NWConnection, id: Int)] = []
+    private var nextWaiter = 0
+    private var failures: [Date] = []
+
+    init(webDir: URL, config: Config? = nil) {
+        self.webDir = webDir
+        if let config {
+            self.config = config
+        } else if let data = try? Data(contentsOf: RemoteServer.file),
+                  let saved = try? JSONDecoder().decode(Config.self, from: data) {
+            self.config = saved
+        } else {
+            self.config = Config()
+        }
+        if self.config.code.isEmpty || self.config.token.isEmpty { newCode(save: config == nil) }
+    }
+
+    /// A new access code, which also signs out any phone signed in with the old one.
+    func newCode(save: Bool = true) {
+        let letters = Array("ACDEFGHJKMNPQRTUVWXY3479")
+        var code = String((0..<8).map { _ in letters[Int.random(in: 0..<letters.count)] })
+        code.insert("-", at: code.index(code.startIndex, offsetBy: 4))
+        config.code = code
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        config.token = bytes.map { String(format: "%02x", $0) }.joined()
+        if save { self.save() }
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        config.enabled = enabled
+        save()
+        enabled ? start() : stop()
+    }
+
+    private func save() {
+        guard let data = try? JSONEncoder().encode(config) else { return }
+        FileManager.default.createFile(atPath: RemoteServer.file.path, contents: data, attributes: [.posixPermissions: 0o600])
+    }
+
+    func start() {
+        guard listener == nil, let port = NWEndpoint.Port(rawValue: config.port) else { return }
+        let parameters = NWParameters.tcp
+        parameters.allowLocalEndpointReuse = true
+        if localOnly { parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port) }
+        do {
+            let listener = localOnly ? try NWListener(using: parameters) : try NWListener(using: parameters, on: port)
+            listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+            listener.stateUpdateHandler = { state in
+                if case .failed(let error) = state { log("Claude Notifier: phone access stopped: \(error)") }
+            }
+            listener.start(queue: queue)
+            self.listener = listener
+        } catch {
+            log("Claude Notifier: could not start phone access on port \(config.port): \(error)")
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        queue.async {
+            for waiter in self.waiting { waiter.connection.cancel() }
+            self.waiting = []
+        }
+    }
+
+    /// The Mac's addresses on your networks, for the phone to open.
+    var addresses: [String] {
+        var found: [String] = []
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return [] }
+        defer { freeifaddrs(list) }
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let interface = pointer.pointee
+            guard let address = interface.ifa_addr, address.pointee.sa_family == UInt8(AF_INET),
+                  interface.ifa_flags & UInt32(IFF_UP) != 0, interface.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            let ip = String(cString: host)
+            if RemoteServer.isPrivate(ip) { found.append("http://\(ip):\(config.port)") }
+        }
+        return found
+    }
+
+    // MARK: State
+
+    /// Takes in a poll's results; a phone waiting for a change gets it now.
+    func publish(_ sessions: [Session], tabs: [String: TerminalTab], labels: [String: SessionLabel]) {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let list: [[String: Any]] = sessions.map { session in
+            let tab = tabs[session.tty]
+            return [
+                "id": session.id,
+                "state": session.state,
+                "status": status(session.state).label,
+                "name": session.name(tabs),
+                "label": labels[session.id]?.text ?? "",
+                "place": session.place,
+                "path": session.path,
+                "task": session.task,
+                "message": session.message,
+                "estimate": estimate(session),
+                "preview": Terminal.tail(tab?.contents ?? "", 30),
+                "background": hex(tab?.background) ?? "#1e1e1e",
+                "foreground": hex(tab?.foreground) ?? "#e6e6e6",
+                "resumable": session.resumable,
+            ]
+        }
+        let dirs = Array(Set(sessions.map(\.path).filter { !$0.isEmpty })).sorted()
+        queue.async {
+            let body: [String: Any] = ["sessions": list, "directories": dirs, "home": home]
+            guard let data = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else { return }
+            self.sessions = sessions
+            guard data != self.state else { return }
+            self.state = data
+            self.version += 1
+            let waiting = self.waiting
+            self.waiting = []
+            for waiter in waiting { self.sendState(waiter.connection) }
+        }
+    }
+
+    private func hex(_ color: Color?) -> String? {
+        guard let color, let c = NSColor(color).usingColorSpace(.sRGB) else { return nil }
+        return String(format: "#%02x%02x%02x", Int(round(c.redComponent * 255)), Int(round(c.greenComponent * 255)),
+                      Int(round(c.blueComponent * 255)))
+    }
+
+    private func sendState(_ connection: NWConnection) {
+        var body = Data("{\"version\":\(version),\"state\":".utf8)
+        body.append(state.isEmpty ? Data("{\"sessions\":[]}".utf8) : state)
+        body.append(Data("}".utf8))
+        respond(connection, 200, body)
+    }
+
+    // MARK: HTTP
+
+    struct Request {
+        var method = ""
+        var path = ""
+        var query: [String: String] = [:]
+        var headers: [String: String] = [:]
+        var body = Data()
+
+        var json: [String: Any] { (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:] }
+
+        var cookie: String? {
+            headers["cookie"]?.split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces) }
+                .first { $0.hasPrefix("cn=") }.map { String($0.dropFirst(3)) }
+        }
+    }
+
+    /// Whether `ip` is on one of your own networks: private, Tailscale's, link-local or this Mac.
+    static func isPrivate(_ ip: String) -> Bool {
+        var ip = ip.lowercased()
+        if let zone = ip.firstIndex(of: "%") { ip = String(ip[..<zone]) }
+        if ip.hasPrefix("::ffff:") { ip = String(ip.dropFirst(7)) }
+        let parts = ip.split(separator: ".").compactMap { Int($0) }
+        if parts.count == 4 {
+            switch (parts[0], parts[1]) {
+            case (10, _), (127, _), (192, 168), (169, 254): return true
+            case (172, 16...31), (100, 64...127): return true
+            default: return false
+            }
+        }
+        return ip == "::1" || ip.hasPrefix("fe8") || ip.hasPrefix("fe9") || ip.hasPrefix("fea") || ip.hasPrefix("feb")
+            || ip.hasPrefix("fc") || ip.hasPrefix("fd")
+    }
+
+    private func accept(_ connection: NWConnection) {
+        guard case .hostPort(let host, _) = connection.endpoint, RemoteServer.isPrivate("\(host)") else {
+            connection.cancel()
+            return
+        }
+        connection.start(queue: queue)
+        receive(connection, Data())
+    }
+
+    /// Reads one request (headers, then the body its Content-Length gives), at most 1 MB.
+    private func receive(_ connection: NWConnection, _ buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, complete, error in
+            guard let self else { return }
+            var buffer = buffer
+            if let data { buffer.append(data) }
+            if let end = buffer.range(of: Data("\r\n\r\n".utf8)) {
+                var request = Request()
+                let head = String(decoding: buffer[..<end.lowerBound], as: UTF8.self).components(separatedBy: "\r\n")
+                let first = head.first?.split(separator: " ") ?? []
+                if first.count >= 2 {
+                    request.method = String(first[0])
+                    let target = String(first[1])
+                    let pieces = target.split(separator: "?", maxSplits: 1)
+                    request.path = String(pieces.first ?? "/")
+                    if pieces.count > 1 {
+                        for pair in pieces[1].split(separator: "&") {
+                            let kv = pair.split(separator: "=", maxSplits: 1).map { String($0).removingPercentEncoding ?? String($0) }
+                            if kv.count == 2 { request.query[kv[0]] = kv[1] }
+                        }
+                    }
+                }
+                for line in head.dropFirst() {
+                    guard let colon = line.firstIndex(of: ":") else { continue }
+                    request.headers[line[..<colon].lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                }
+                let length = min(Int(request.headers["content-length"] ?? "") ?? 0, 1 << 20)
+                let body = buffer[end.upperBound...]
+                if body.count >= length {
+                    request.body = Data(body.prefix(length))
+                    self.handle(request, connection)
+                    return
+                }
+            }
+            if complete || error != nil || buffer.count > (1 << 20) + 8192 {
+                connection.cancel()
+                return
+            }
+            self.receive(connection, buffer)
+        }
+    }
+
+    private func respond(_ connection: NWConnection, _ status: Int, _ body: Data, type: String = "application/json",
+                         headers: [String] = []) {
+        let reason = [200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found", 429: "Too Many Requests"][status] ?? "Error"
+        var head = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: \(type)\r\nContent-Length: \(body.count)\r\n"
+        head += "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n"
+        for header in headers { head += header + "\r\n" }
+        var data = Data((head + "\r\n").utf8)
+        data.append(body)
+        connection.send(content: data, completion: .contentProcessed { _ in connection.cancel() })
+    }
+
+    private func respond(_ connection: NWConnection, _ status: Int, _ json: [String: Any], headers: [String] = []) {
+        respond(connection, status, (try? JSONSerialization.data(withJSONObject: json)) ?? Data(), headers: headers)
+    }
+
+    private func signedIn(_ request: Request) -> Bool {
+        guard let given = request.cookie else { return false }
+        let a = Array(given.utf8), b = Array(config.token.utf8)
+        guard a.count == b.count else { return false }
+        return zip(a, b).reduce(0) { $0 | ($1.0 ^ $1.1) } == 0
+    }
+
+    private func handle(_ request: Request, _ connection: NWConnection) {
+        // The page and its files need no code; everything under /api does.
+        if request.method == "GET", !request.path.hasPrefix("/api/") {
+            let files = ["/": ("index.html", "text/html; charset=utf-8"),
+                         "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+                         "/icon.svg": ("icon.svg", "image/svg+xml")]
+            guard let (name, type) = files[request.path],
+                  let data = try? Data(contentsOf: webDir.appendingPathComponent(name)) else {
+                return respond(connection, 404, ["error": "Not found"])
+            }
+            return respond(connection, 200, data, type: type)
+        }
+        if request.path == "/api/login", request.method == "POST" { return login(request, connection) }
+        guard signedIn(request) else { return respond(connection, 401, ["error": "Enter the access code"]) }
+        let body = request.json
+        let session = (body["id"] as? String ?? request.query["id"]).flatMap { id in sessions.first { $0.id == id } }
+
+        switch (request.method, request.path) {
+        case ("GET", "/api/state"):
+            // Answers at once if the phone's copy is out of date, else when something changes (or
+            // after 25 seconds), so the phone sees changes as they happen.
+            if Int(request.query["v"] ?? "") != version || state.isEmpty { return sendState(connection) }
+            nextWaiter += 1
+            let id = nextWaiter
+            waiting.append((connection, id))
+            queue.asyncAfter(deadline: .now() + 25) { [weak self] in
+                guard let self, let i = self.waiting.firstIndex(where: { $0.id == id }) else { return }
+                self.waiting.remove(at: i)
+                self.sendState(connection)
+            }
+        case ("GET", "/api/history"):
+            guard let session else { return respond(connection, 404, ["error": "No such session"]) }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let text = self.history(session)
+                self.queue.async { self.respond(connection, 200, ["text": text]) }
+            }
+        case ("POST", "/api/prompt"):
+            let text = (body["text"] as? String ?? "").filter { !$0.isASCII || $0.asciiValue! >= 32 || $0 == "\n" }
+            guard let session, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return respond(connection, 400, ["error": "Nothing to send"])
+            }
+            act(.prompt(session, String(text.prefix(20000))), connection)
+        case ("POST", "/api/focus"):
+            guard let session else { return respond(connection, 404, ["error": "No such session"]) }
+            act(.focus(session), connection)
+        case ("POST", "/api/close"):
+            guard let session else { return respond(connection, 404, ["error": "No such session"]) }
+            act(.close(session), connection)
+        case ("POST", "/api/label"):
+            guard let session else { return respond(connection, 404, ["error": "No such session"]) }
+            act(.label(session, String((body["text"] as? String ?? "").prefix(80))), connection)
+        case ("POST", "/api/seen"):
+            guard let session else { return respond(connection, 404, ["error": "No such session"]) }
+            act(.seen(session), connection)
+        case ("POST", "/api/start"):
+            let path = ((body["directory"] as? String ?? "") as NSString).expandingTildeInPath
+            var isDirectory: ObjCBool = false
+            if !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) {
+                guard body["create"] as? Bool == true, path.hasPrefix("/"),
+                      (try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)) != nil else {
+                    return respond(connection, 400, ["error": "No such folder"])
+                }
+            } else if !isDirectory.boolValue {
+                return respond(connection, 400, ["error": "That is a file, not a folder"])
+            }
+            let source = (body["source"] as? String).flatMap { id in sessions.first { $0.id == id && $0.resumable }?.id }
+            act(.start(directory: path, source: source), connection)
+        default:
+            respond(connection, 404, ["error": "Not found"])
+        }
+    }
+
+    private func act(_ action: RemoteAction, _ connection: NWConnection) {
+        DispatchQueue.main.async {
+            self.perform(action)
+            self.queue.async { self.respond(connection, 200, ["ok": true]) }
+        }
+    }
+
+    private func login(_ request: Request, _ connection: NWConnection) {
+        failures.removeAll { Date().timeIntervalSince($0) > 60 }
+        guard failures.count < 5 else {
+            return respond(connection, 429, ["error": "Too many wrong codes; try again in a minute"])
+        }
+        let normal = { (s: String) in s.uppercased().filter { $0.isLetter || $0.isNumber } }
+        guard normal(request.json["code"] as? String ?? "") == normal(config.code) else {
+            failures.append(Date())
+            return respond(connection, 401, ["error": "That code is not right"])
+        }
+        respond(connection, 200, ["ok": true],
+                headers: ["Set-Cookie: cn=\(config.token); Max-Age=31536000; Path=/; HttpOnly; SameSite=Strict"])
     }
 }
 
@@ -1282,6 +1739,29 @@ enum Screenshots {
 }
 
 let app = NSApplication.shared
+// Serves the phone page with the screenshots' demo sessions, on this computer only, for trying it out:
+//   ClaudeNotifier --serve-demo <port> <web dir>    (the access code is DEMO-CODE)
+if let flag = CommandLine.arguments.firstIndex(of: "--serve-demo"), CommandLine.arguments.count > flag + 2 {
+    app.setActivationPolicy(.prohibited)
+    let (sessions, tabs) = Screenshots.demo()
+    var labels = [sessions[1].id: SessionLabel(text: "Rate limiter", tty: sessions[1].tty)]
+    let server = RemoteServer(webDir: URL(fileURLWithPath: CommandLine.arguments[flag + 2]),
+                              config: .init(enabled: true, port: UInt16(CommandLine.arguments[flag + 1]) ?? 7879,
+                                            code: "DEMO-CODE", token: UUID().uuidString))
+    server.localOnly = true
+    // The demo's own screens, never a real terminal's.
+    server.history = { tabs[$0.tty]?.contents ?? "" }
+    server.perform = { action in
+        if case .label(let session, let text) = action {
+            labels[session.id] = text.isEmpty ? nil : SessionLabel(text: text, tty: session.tty)
+        }
+        print("demo: \(action)")
+        server.publish(sessions, tabs: tabs, labels: labels)
+    }
+    server.start()
+    server.publish(sessions, tabs: tabs, labels: labels)
+    app.run()
+}
 if let flag = CommandLine.arguments.firstIndex(of: "--screenshots"), CommandLine.arguments.count > flag + 1 {
     app.setActivationPolicy(.accessory)
     Screenshots.run(into: URL(fileURLWithPath: CommandLine.arguments[flag + 1]))

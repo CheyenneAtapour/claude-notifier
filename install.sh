@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds Claude Notifier from this repo and installs it for this user:
-#   ~/.claude/notifier/Claude Notifier.app        the menu bar app, started at login
+#   ~/.claude/notifier/Claude Notifier.app        the menu bar app, started at login, with the phone page
 #   ~/.claude/notifier/hook.sh                    a link to this repo's hook.sh
 #   ~/.claude/bin/popcorn-terminal, claude-fork   links to this repo's bin/
 #   Claude Code hooks in ~/.claude/settings.json  replacing any earlier notifier hooks
@@ -23,6 +23,10 @@ echo "Building $app"
 mkdir -p "$dest/sessions" "$app/Contents/MacOS" "$HOME/.claude/bin" "$(dirname "$plist")"
 cp "$repo/support/Info.plist" "$app/Contents/Info.plist"
 swiftc -O "$repo/ClaudeNotifier.swift" -o "$app/Contents/MacOS/ClaudeNotifier"
+# The phone page, served when you turn on Phone Access.
+rm -rf "$app/Contents/Resources/web"
+mkdir -p "$app/Contents/Resources"
+cp -R "$repo/web" "$app/Contents/Resources/web"
 codesign --force -s - "$app"
 
 echo "Linking the hook and scripts"

@@ -8,6 +8,7 @@
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.1</string>
   <key>LSUIElement</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>With Phone Access on, Claude Notifier serves its dashboard to your phone on your network.</string>
   <key>NSAppleEventsUsageDescription</key><string>Claude Notifier brings the Claude session you click to the front in Terminal.</string>
 </dict>
 </plist>

@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16161a">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg">
+<title>Claude Sessions</title>
+<style>
+  :root {
+    --bg: #f4f4f6; --card: #ffffff; --text: #1b1b1f; --muted: #6b6b75; --line: #d9d9e0;
+    --input: #1f9d55; --working: #2f6fed; --done: #e0453a; --idle: #8a8a94; --tag: #8e44c9;
+    --focus: #2f6fed;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --card: #222228; --text: #ececf1; --muted: #9a9aa6; --line: #33333c;
+      --input: #3ccf7a; --working: #6c9cff; --done: #ff6b5e; --idle: #9a9aa6; --tag: #c58af0;
+      --focus: #6c9cff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.35 system-ui, -apple-system, Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  button { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; }
+  button:active { opacity: .7; }
+  button.danger { color: var(--done); }
+  button.primary { background: var(--focus); border-color: var(--focus); color: #fff; }
+  button.primary.danger { background: var(--done); border-color: var(--done); color: #fff; }
+  input, textarea, select { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; width: 100%; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid var(--focus); outline-offset: -1px; }
+  kbd { font: 600 11px ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 4px; padding: 0 4px; color: var(--muted); }
+  .hidden { display: none !important; }
+
+  header { display: flex; align-items: center; gap: 8px; padding: 10px 12px 6px; }
+  header h1 { font-size: 17px; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .count { font-weight: 700; }
+  .count.done { color: var(--done); } .count.input { color: var(--input); }
+  #banner { margin: 0 12px 6px; padding: 6px 10px; border-radius: 8px; background: var(--done); color: #fff; font-size: 13px; }
+
+  main { flex: 1; overflow-y: auto; padding: 4px 12px 8px; }
+  .card { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 9px 10px; margin-bottom: 8px; }
+  .card.selected { outline: 2px solid var(--focus); outline-offset: 1px; }
+  .card[data-state=input] { border-color: color-mix(in srgb, var(--input) 55%, var(--line)); }
+  .card[data-state=done] { border-color: color-mix(in srgb, var(--done) 55%, var(--line)); }
+  .card[data-state=working] { border-color: color-mix(in srgb, var(--working) 45%, var(--line)); }
+  .dot { position: absolute; top: -4px; right: -4px; width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid var(--bg); }
+  .row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .num { font: 600 11px ui-monospace, monospace; color: var(--muted); width: 12px; flex: none; }
+  .pill { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px; flex: none; }
+  .name { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tag { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px; flex: none;
+    color: var(--tag); background: color-mix(in srgb, var(--tag) 16%, transparent); }
+  .tag::before { content: "🏷 "; font-size: 10px; }
+  .place { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .task { margin-top: 3px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .task.none { color: var(--muted); }
+  .message { color: var(--input); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .estimate { color: var(--muted); font-size: 12px; }
+  .screen { margin-top: 6px; border-radius: 8px; padding: 6px 8px; overflow: hidden; white-space: pre;
+    font: 10.5px/1.3 ui-monospace, Menlo, monospace; }
+  .card .screen { max-height: 7.2em; display: flex; flex-direction: column; justify-content: flex-end; }
+  .empty { color: var(--muted); text-align: center; margin-top: 40px; }
+
+  footer { padding: 6px 12px 8px; font-size: 11.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 10px;
+    border-top: 1px solid var(--line); }
+
+  #detail { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 0 12px 10px; gap: 6px; }
+  #detail .screen { flex: 1; min-height: 80px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    font-size: 11px; margin-top: 2px; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .send { display: flex; gap: 6px; align-items: flex-end; }
+  .send textarea { resize: none; min-height: 40px; max-height: 120px; }
+
+  /* Full screen: the terminal and the prompt bar, nothing else. */
+  #exit-full { display: none; }
+  body.full #detail-view header, body.full #d-tags, body.full #d-place, body.full #d-task,
+  body.full #d-message, body.full #d-estimate, body.full .actions, body.full #banner { display: none; }
+  body.full #detail { padding: 0; gap: 0; }
+  body.full #d-screen { margin: 0; border-radius: 0; font-size: 12px; padding: 8px 10px; cursor: auto; }
+  body.full .send { padding: 6px 8px; background: var(--bg); border-top: 1px solid var(--line); }
+  body.full #exit-full { display: block; position: fixed; top: calc(6px + env(safe-area-inset-top)); right: 8px;
+    z-index: 5; opacity: .75; padding: 2px 9px; }
+  #d-screen { cursor: zoom-in; }
+
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center;
+    justify-content: center; padding: 16px; z-index: 10; }
+  .dialog { background: var(--card); border-radius: 14px; padding: 14px; width: 100%; max-width: 440px;
+    display: flex; flex-direction: column; gap: 10px; border: 1px solid var(--line); }
+  .dialog h2 { margin: 0; font-size: 16px; }
+  .dialog p { margin: 0; color: var(--muted); font-size: 13px; }
+  .dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; }
+  .choices { display: flex; flex-direction: column; gap: 4px; max-height: 40vh; overflow-y: auto; }
+  .choice { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); }
+  .choice.on { border-color: var(--focus); background: color-mix(in srgb, var(--focus) 12%, transparent); }
+  .choice span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+  .check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  .check input { width: auto; }
+
+  #login { flex: 1; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  #login .dialog { max-width: 360px; }
+  #login input { font: 600 20px ui-monospace, monospace; letter-spacing: 2px; text-transform: uppercase; text-align: center; }
+  .error { color: var(--done); font-size: 13px; min-height: 1em; }
+</style>
+</head>
+<body>
+
+<section id="login" class="hidden">
+  <form class="dialog" id="login-form">
+    <h2>✳︎ Claude Sessions</h2>
+    <p>Enter the access code from the Mac's menu bar: ✳︎ Claude → Phone Access.</p>
+    <input id="code" autocomplete="off" data-1p-ignore data-lpignore="true" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX" maxlength="12">
+    <div class="error" id="login-error"></div>
+    <div class="buttons"><button class="primary" type="submit">Sign in</button></div>
+  </form>
+</section>
+
+<section id="list-view" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0">
+  <header>
+    <h1>✳︎ Claude <span id="counts"></span></h1>
+    <button id="new-button">+ New</button>
+  </header>
+  <div id="banner" class="hidden"></div>
+  <main id="cards"></main>
+  <footer>
+    <span><kbd>J</kbd><kbd>K</kbd> move</span>
+    <span><kbd>↵</kbd> open</span>
+    <span><kbd>1</kbd>–<kbd>9</kbd> jump</span>
+    <span><kbd>B</kbd> to front</span>
+    <span><kbd>L</kbd> label</span>
+    <span><kbd>N</kbd> new</span>
+    <span><kbd>X</kbd> close</span>
+  </footer>
+</section>
+
+<section id="detail-view" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0">
+  <header>
+    <button id="back">‹ <kbd>Esc</kbd></button>
+    <h1 id="d-name"></h1>
+  </header>
+  <div id="detail">
+    <div class="row" id="d-tags"></div>
+    <div class="place" id="d-place"></div>
+    <div class="task" id="d-task"></div>
+    <div class="message" id="d-message"></div>
+    <div class="estimate" id="d-estimate"></div>
+    <div class="screen" id="d-screen"></div>
+    <div class="actions">
+      <button id="d-front">To front</button>
+      <button id="d-label">Label…</button>
+      <button id="d-close" class="danger">Close…</button>
+      <button id="d-full">⛶ Full screen <kbd>Alt</kbd><kbd>F</kbd></button>
+    </div>
+    <form class="send" id="send-form">
+      <textarea id="prompt" rows="1" placeholder="Type a prompt, ↵ to send" autocapitalize="sentences"></textarea>
+      <button class="primary" type="submit">Send</button>
+    </form>
+  </div>
+</section>
+
+<button id="exit-full" title="Leave full screen (Esc)">✕</button>
+
+<div id="overlay" class="overlay hidden"><div class="dialog" id="dialog"></div></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const colors = { input: "var(--input)", working: "var(--working)", done: "var(--done)", idle: "var(--idle)" };
+
+let sessions = [], directories = [], home = "~", version = -1;
+let selectedId = null;   // the card the keyboard is on
+let openId = null;       // the session shown large
+let dialog = null;       // { onKey } while a dialog is open
+const drafts = {};       // unsent prompts, by session
+
+// --- Talking to the Mac --------------------------------------------------
+
+async function api(path, body) {
+  const response = await fetch(path, body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  if (response.status === 401 && path !== "/api/login") { showLogin(); throw new Error("signed out"); }
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(json.error || `Error ${response.status}`);
+  return json;
+}
+
+// Asks for the state; the Mac answers when it changes, so this loop is always waiting on it.
+async function follow() {
+  for (;;) {
+    try {
+      const reply = await api(`/api/state?v=${version}`);
+      version = reply.version;
+      sessions = reply.state.sessions || [];
+      directories = reply.state.directories || [];
+      home = reply.state.home || home;
+      banner("");
+      if ($("login").classList.contains("hidden") === false) showList();
+      render();
+    } catch (error) {
+      if (error.message === "signed out") return;
+      banner("Can't reach the Mac. Retrying…");
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+
+function banner(text) {
+  $("banner").textContent = text;
+  $("banner").classList.toggle("hidden", !text);
+}
+
+async function act(path, body, okText) {
+  try {
+    await api(path, body);
+    if (okText) flash(okText);
+  } catch (error) {
+    if (error.message !== "signed out") flash(error.message, true);
+  }
+}
+
+let flashTimer;
+function flash(text, bad) {
+  const b = $("banner");
+  b.textContent = text;
+  b.style.background = bad ? "var(--done)" : "var(--working)";
+  b.classList.remove("hidden");
+  // The banner lives in the list; in the large view, show it there too.
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => { b.style.background = ""; banner(""); }, 2000);
+  if (openId) { $("d-estimate").textContent = text; }
+}
+
+// --- Views -----------------------------------------------------------------
+
+function showLogin() {
+  for (const id of ["list-view", "detail-view"]) $(id).classList.add("hidden");
+  $("login").classList.remove("hidden");
+  $("code").focus();
+}
+
+// Full screen: only the terminal and the prompt bar, and without the browser's bars where it allows.
+function setFull(on) {
+  const screen = $("d-screen");
+  const atBottom = screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
+  document.body.classList.toggle("full", on);
+  if (on && !document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {});
+  if (!on && document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+  if (atBottom) screen.scrollTop = screen.scrollHeight;
+}
+
+// Leaving the browser's full screen (its back gesture, say) leaves ours too.
+document.addEventListener("fullscreenchange", () => {
+  if (!document.fullscreenElement && document.body.classList.contains("full")) setFull(false);
+});
+
+function showList() {
+  setFull(false);
+  openId = null;
+  $("login").classList.add("hidden");
+  $("detail-view").classList.add("hidden");
+  $("list-view").classList.remove("hidden");
+  document.activeElement?.blur();
+  render();
+}
+
+function pill(session) {
+  const p = document.createElement("span");
+  p.className = "pill";
+  p.textContent = session.status;
+  p.style.color = colors[session.state] || colors.idle;
+  p.style.background = `color-mix(in srgb, ${colors[session.state] || colors.idle} 16%, transparent)`;
+  return p;
+}
+
+function tag(text) {
+  const t = document.createElement("span");
+  t.className = "tag";
+  t.textContent = text;
+  return t;
+}
+
+function el(tag, className, text) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function render() {
+  const done = sessions.filter((s) => s.state === "done").length;
+  const input = sessions.filter((s) => s.state === "input").length;
+  const counts = $("counts");
+  counts.replaceChildren();
+  if (done) counts.append(el("span", "count done", ` ● ${done}`));
+  if (input) counts.append(el("span", "count input", ` ● ${input}`));
+  document.title = `Claude${done + input ? ` (${done + input})` : ""}`;
+
+  if (!sessions.some((s) => s.id === selectedId)) selectedId = sessions[0]?.id ?? null;
+  const cards = $("cards");
+  if (!sessions.length) {
+    cards.replaceChildren(el("div", "empty", "No Claude sessions are open on the Mac."));
+  } else {
+    cards.replaceChildren(...sessions.map((s, i) => card(s, i)));
+  }
+  if (openId) renderDetail();
+}
+
+function card(s, i) {
+  const c = el("div", "card" + (s.id === selectedId ? " selected" : ""));
+  c.dataset.state = s.state;
+  if (s.state === "done" || s.state === "input") {
+    const d = el("span", "dot");
+    d.style.background = colors[s.state];
+    c.append(d);
+  }
+  const top = el("div", "row");
+  top.append(el("span", "num", i < 9 ? String(i + 1) : ""), pill(s), el("span", "name", s.name));
+  c.append(top);
+  const second = el("div", "row");
+  if (s.label) second.append(tag(s.label));
+  if (s.place) second.append(el("span", "place", s.place));
+  if (second.childNodes.length) c.append(second);
+  c.append(el("div", "task" + (s.task ? "" : " none"), s.task || "No prompt seen yet"));
+  if (s.state === "input" && s.message) c.append(el("div", "message", s.message));
+  c.append(el("div", "estimate", s.estimate));
+  if (s.preview) {
+    const screen = el("div", "screen");
+    screen.style.background = s.background;
+    screen.style.color = s.foreground;
+    screen.append(el("div", "", s.preview.split("\n").slice(-6).join("\n")));
+    c.append(screen);
+  }
+  c.addEventListener("click", () => { selectedId = s.id; open(s.id); });
+  return c;
+}
+
+function current() { return sessions.find((s) => s.id === (openId || selectedId)); }
+
+function open(id) {
+  openId = id;
+  selectedId = id;
+  $("list-view").classList.add("hidden");
+  $("detail-view").classList.remove("hidden");
+  $("prompt").value = drafts[id] || "";
+  $("d-screen").textContent = "";
+  renderDetail();
+  fetchHistory(true);
+  const s = current();
+  if (s && s.state === "done") act("/api/seen", { id });
+  $("prompt").focus();
+}
+
+function renderDetail() {
+  const s = current();
+  if (!s) { showList(); return; }
+  $("d-name").textContent = s.name;
+  const tags = $("d-tags");
+  tags.replaceChildren(pill(s));
+  if (s.label) tags.append(tag(s.label));
+  $("d-place").textContent = s.place;
+  $("d-task").textContent = s.task || "No prompt seen yet";
+  $("d-task").className = "task" + (s.task ? "" : " none");
+  $("d-message").textContent = s.state === "input" ? s.message : "";
+  $("d-estimate").textContent = s.estimate;
+  const screen = $("d-screen");
+  screen.style.background = s.background;
+  screen.style.color = s.foreground;
+  if (!screen.textContent) screen.textContent = s.preview;
+}
+
+// The large view's scrollback, every few seconds while it is open.
+let historyTimer;
+async function fetchHistory(first) {
+  clearTimeout(historyTimer);
+  const id = openId;
+  if (!id) return;
+  try {
+    const { text } = await api(`/api/history?id=${encodeURIComponent(id)}`);
+    if (openId !== id) return;
+    const screen = $("d-screen");
+    const atBottom = first || screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
+    if (text && screen.textContent !== text) screen.textContent = text;
+    if (atBottom) screen.scrollTop = screen.scrollHeight;
+  } catch {}
+  historyTimer = setTimeout(() => fetchHistory(false), 3000);
+}
+
+// --- Dialogs -----------------------------------------------------------------
+
+function openDialog(build, onKey) {
+  const box = $("dialog");
+  box.replaceChildren();
+  build(box);
+  $("overlay").classList.remove("hidden");
+  dialog = { onKey };
+}
+
+function closeDialog() {
+  $("overlay").classList.add("hidden");
+  dialog = null;
+  document.activeElement?.blur();   // or keys would still go to the hidden dialog's field
+  if (openId) $("prompt").focus();
+}
+
+function buttons(...list) {
+  const row = el("div", "buttons");
+  for (const [text, className, onClick] of list) {
+    const b = el("button", className, text);
+    b.type = "button";
+    b.addEventListener("click", onClick);
+    row.append(b);
+  }
+  return row;
+}
+
+function editLabel(s) {
+  if (!s) return;
+  let input;
+  const save = () => { act("/api/label", { id: s.id, text: input.value.trim() }); closeDialog(); };
+  openDialog((box) => {
+    box.append(el("h2", "", "Label"), el("p", "", `${s.name} — shown on the dashboards only. Leave empty to remove it.`));
+    input = el("input");
+    input.value = s.label;
+    input.maxLength = 80;
+    box.append(input, buttons(["Cancel", "", closeDialog], ["Save", "primary", save]));
+    setTimeout(() => { input.focus(); input.select(); });
+  }, (e) => {
+    if (e.key === "Enter") { e.preventDefault(); save(); }
+  });
+}
+
+function confirmClose(s) {
+  if (!s) return;
+  const yes = () => {
+    act("/api/close", { id: s.id }, "Closing…");
+    closeDialog();
+    if (openId) showList();
+  };
+  openDialog((box) => {
+    box.append(el("h2", "", "Close this Claude session?"),
+      el("p", "", `${s.name}${s.label ? ` (${s.label})` : ""} · ${s.place}. Claude exits and its window closes. ` +
+        "The conversation is kept: claude --resume reopens it."),
+      buttons(["Cancel  N", "", closeDialog], ["Close session  Y", "primary danger", yes]));
+  }, (e) => {
+    if (e.key === "y" || e.key === "Y" || e.key === "Enter") { e.preventDefault(); yes(); }
+    else if (e.key === "n" || e.key === "N") { e.preventDefault(); closeDialog(); }
+  });
+}
+
+function newSession() {
+  const forkable = sessions.filter((s) => s.resumable);
+  let source = null, dir, create;
+  const choose = (i) => {
+    source = i === 0 ? null : forkable[i - 1].id;
+    [...document.querySelectorAll(".choice")].forEach((c, j) => c.classList.toggle("on", j === i));
+  };
+  const start = () => {
+    const directory = dir.value.trim();
+    if (!directory) return;
+    act("/api/start", { directory, source, create: create.checked }, "Opening a new window on the Mac…");
+    closeDialog();
+  };
+  openDialog((box) => {
+    box.append(el("h2", "", "New Claude session"));
+    dir = el("input");
+    dir.value = home.replace(/^\/Users\/[^/]+/, "~");
+    dir.setAttribute("list", "dirs");
+    dir.spellcheck = false;
+    dir.autocapitalize = "off";
+    const list = el("datalist");
+    list.id = "dirs";
+    for (const d of directories) { const o = el("option"); o.value = d; list.append(o); }
+    const createRow = el("label", "check");
+    create = el("input");
+    create.type = "checkbox";
+    createRow.append(create, document.createTextNode("Create the folder if it doesn't exist"));
+    const choices = el("div", "choices");
+    const options = ["Fresh context", ...forkable.map((s) => `Copy of ${s.label ? s.label + " · " : ""}${s.name}`)];
+    options.forEach((text, i) => {
+      const c = el("div", "choice" + (i === 0 ? " on" : ""));
+      c.append(el("kbd", "", String(i)), el("span", "", text));
+      c.addEventListener("click", () => choose(i));
+      choices.append(c);
+    });
+    box.append(el("p", "", "Folder on the Mac"), dir, list, createRow,
+      el("p", "", "Context — a copy starts with that session's whole conversation (Alt+number picks)"), choices,
+      buttons(["Cancel", "", closeDialog], ["Start", "primary", start]));
+    setTimeout(() => dir.focus());
+  }, (e) => {
+    if (e.key === "Enter") { e.preventDefault(); start(); }
+    else if (e.altKey && /^[0-9]$/.test(e.key) && Number(e.key) <= forkable.length) { e.preventDefault(); choose(Number(e.key)); }
+  });
+}
+
+// --- Keyboard ---------------------------------------------------------------
+
+function move(step) {
+  if (!sessions.length) return;
+  const i = Math.max(0, sessions.findIndex((s) => s.id === selectedId));
+  selectedId = sessions[Math.min(sessions.length - 1, Math.max(0, i + step))].id;
+  render();
+  document.querySelector(".card.selected")?.scrollIntoView({ block: "nearest" });
+}
+
+document.addEventListener("keydown", (e) => {
+  if (!$("login").classList.contains("hidden")) return;
+  if (dialog) {
+    if (e.key === "Escape") { e.preventDefault(); closeDialog(); return; }
+    dialog.onKey(e);
+    return;
+  }
+  if (e.ctrlKey || e.metaKey) return;
+  const typing = ["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName);
+
+  if (openId) {
+    if (e.key === "Escape" && document.body.classList.contains("full")) { e.preventDefault(); setFull(false); return; }
+    if (e.key === "Escape") { e.preventDefault(); drafts[openId] = $("prompt").value; showList(); return; }
+    // Alt+F works while typing a prompt; F alone when not.
+    if (e.altKey && e.code === "KeyF") {
+      e.preventDefault();
+      setFull(!document.body.classList.contains("full"));
+      return;
+    }
+    if (typing) return;
+    const key = e.key.toLowerCase();
+    if (key === "f") { e.preventDefault(); setFull(!document.body.classList.contains("full")); $("prompt").focus(); return; }
+    if (key === "b") { e.preventDefault(); act("/api/focus", { id: openId }, "Brought to front on the Mac"); }
+    else if (key === "l") { e.preventDefault(); editLabel(current()); }
+    else if (key === "x") { e.preventDefault(); confirmClose(current()); }
+    else if (e.key.length === 1 && !e.altKey) $("prompt").focus();   // typing starts a prompt
+    return;
+  }
+
+  if (typing) return;
+  const key = e.key.toLowerCase();
+  const s = current();
+  if (key === "j" || e.key === "ArrowDown") { e.preventDefault(); move(1); }
+  else if (key === "k" || e.key === "ArrowUp") { e.preventDefault(); move(-1); }
+  else if ((e.key === "Enter" || key === "o") && s) { e.preventDefault(); open(s.id); }
+  else if (/^[1-9]$/.test(e.key) && sessions[Number(e.key) - 1]) { e.preventDefault(); open(sessions[Number(e.key) - 1].id); }
+  else if (key === "b" && s) { e.preventDefault(); act("/api/focus", { id: s.id }, "Brought to front on the Mac"); }
+  else if (key === "l") { e.preventDefault(); editLabel(s); }
+  else if (key === "x") { e.preventDefault(); confirmClose(s); }
+  else if (key === "n") { e.preventDefault(); newSession(); }
+});
+
+// --- Wiring -------------------------------------------------------------------
+
+$("login-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("login-error").textContent = "";
+  try {
+    await api("/api/login", { code: $("code").value });
+    $("code").value = "";
+    version = -1;
+    showList();
+    follow();
+  } catch (error) {
+    $("login-error").textContent = error.message;
+  }
+});
+
+$("send-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = $("prompt").value.trim();
+  if (!text || !openId) return;
+  act("/api/prompt", { id: openId, text }, "Sent");
+  $("prompt").value = "";
+  drafts[openId] = "";
+});
+
+$("prompt").addEventListener("keydown", (e) => {
+  // Enter sends; Shift+Enter is a line break (sent as a space, as on the Mac).
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("send-form").requestSubmit(); }
+});
+
+$("back").addEventListener("click", () => { if (openId) drafts[openId] = $("prompt").value; showList(); });
+$("d-front").addEventListener("click", () => act("/api/focus", { id: openId }, "Brought to front on the Mac"));
+$("d-label").addEventListener("click", () => editLabel(current()));
+$("d-close").addEventListener("click", () => confirmClose(current()));
+$("new-button").addEventListener("click", newSession);
+$("d-full").addEventListener("click", () => { setFull(true); $("prompt").focus(); });
+$("exit-full").addEventListener("click", () => setFull(false));
+// A tap on the terminal makes it full screen; a scroll or a text selection does not.
+$("d-screen").addEventListener("click", () => {
+  if (document.body.classList.contains("full") || String(getSelection())) return;
+  setFull(true);
+  $("prompt").focus();
+});
+$("overlay").addEventListener("click", (e) => { if (e.target === $("overlay")) closeDialog(); });
+
+showList();
+follow();
+</script>
+</body>
+</html>

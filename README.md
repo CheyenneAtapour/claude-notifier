@@ -15,6 +15,8 @@ Terminal on this machine:
   session with its status, task and a live preview of its screen; brings the
   right Terminal tab to the front; lets you send a session a prompt; and starts
   new sessions, fresh or with a copy of another session's context.
+- **It reaches your phone.** Turn on Phone Access and the dashboard opens in your
+  phone's browser on your own network, made for a phone with a keyboard.
 
 ![The dashboard: one card per Claude session, tinted by status, with a live preview of each terminal](docs/dashboard.png)
 
@@ -130,6 +132,62 @@ Find a session's id with `/status` inside it, or pick from a list with
 Copies share your machine with the original: if both edit the same checkout,
 give the copy its own git worktree. One copy holds one conversation; Claude Code
 cannot merge several into one.
+
+## On your phone
+
+Phone Access serves a phone-sized dashboard from the Mac, so you can follow your
+sessions and send them prompts from a phone on the same network. It is off until
+you turn it on.
+
+1. On the Mac: **✳︎ Claude → Phone Access → Allow Phone Access**. The first time,
+   macOS may ask whether Claude Notifier may accept incoming connections; allow
+   it. The same menu then shows the address to open (such as
+   `http://192.168.1.20:7878`) and an access code.
+2. On the phone: open the address in the browser and enter the code once. The
+   phone stays signed in. In Chrome, **⋮ → Add to Home screen** gives it an icon.
+
+The phone shows each session's status, label, task, rough ETA and the last lines
+of its screen, live, with needs-you and done sessions first, as on the Mac. Open
+one for its scrollback and a prompt box. It works from a hardware keyboard:
+
+| Key | In the list | In a session |
+| --- | --- | --- |
+| <kbd>J</kbd> / <kbd>K</kbd> | move between sessions | |
+| <kbd>Enter</kbd>, <kbd>O</kbd> or <kbd>1</kbd>–<kbd>9</kbd> | open one | send the prompt |
+| <kbd>B</kbd> | bring it to the front on the Mac | the same, when not typing |
+| <kbd>L</kbd> | label it | the same, when not typing |
+| <kbd>X</kbd> | close it, after you confirm (<kbd>Y</kbd> / <kbd>N</kbd>) | the same, when not typing |
+| <kbd>N</kbd> | start a new session: a folder (created if you ask), fresh or a copy of a session's context | |
+| <kbd>Esc</kbd> | | back to the list, keeping your draft |
+
+In a session, typing goes straight into the prompt box. **Tap the terminal** (or
+**Full screen**, or <kbd>Alt</kbd>+<kbd>F</kbd>) to make it fill the whole screen with
+just the prompt bar under it, still scrolling and still taking prompts;
+<kbd>Esc</kbd>, <kbd>Alt</kbd>+<kbd>F</kbd> or the ✕ in the corner leaves full screen. Opening a finished
+session from the phone clears its red count, as looking at it on the Mac does.
+
+**Keeping it safe.** Anyone who can send a session a prompt can run commands on
+your Mac, so:
+
+- it answers only devices on private networks (home Wi-Fi, or Tailscale), never
+  the internet, and only after the access code. Five wrong codes lock it for a
+  minute;
+- **New Access Code** in the same menu signs the phone out; turning Phone Access
+  off stops the server;
+- the connection is plain HTTP, readable by others on the same Wi-Fi. Use it on
+  networks you trust; [Tailscale](https://tailscale.com) encrypts it, and also
+  reaches the Mac when you are away from home.
+
+The Mac has to be awake (a locked screen is fine). The setting, port (7878) and
+code are in `~/.claude/notifier/remote.json`.
+
+To try the page on the Mac with the demo sessions (code `DEMO-CODE`), without
+touching your real ones:
+
+```sh
+swiftc -O ClaudeNotifier.swift -o /tmp/ClaudeNotifier && /tmp/ClaudeNotifier --serve-demo 7879 web
+# then open http://127.0.0.1:7879
+```
 
 ## Install
 
