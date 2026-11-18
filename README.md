@@ -37,8 +37,9 @@ click in it. A session that needs you stays green until you answer.
 ## The dashboard
 
 Open it from the menu bar with **Open Dashboard…**. Every Claude session running
-in Terminal gets a card, grouped by status and, within each group, most recently
-prompted first:
+in Terminal gets a card, grouped by status. Within a group, a session takes its
+place when it arrives (the one you prompted most recently first) and keeps it
+while it stays, so cards don't swap as you prompt them:
 
 | Status | Colour | Meaning |
 | --- | --- | --- |

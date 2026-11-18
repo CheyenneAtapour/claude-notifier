@@ -129,16 +129,36 @@ func takeSnapshot() -> Snapshot {
             sessions[i].state = "working"
         }
     }
-    // Those needing you first, then working, then done, then idle; within each,
-    // the one you prompted (or, never prompted, opened) most recently first.
-    // Ties go by terminal, so they keep their places between refreshes.
+    // Those needing you first, then working, then done, then idle. Within each,
+    // a session takes its place when it arrives, the one you prompted (or, never
+    // prompted, opened) most recently first, and keeps it while it stays: prompting
+    // a working session again does not move it. Ties go by terminal.
     let rank = ["input": 0, "working": 1, "done": 2]
+    var placed: [String: Standing] = [:]
+    for session in sessions {
+        let r = rank[session.state] ?? 3
+        if let old = standings[session.id], old.rank == r {
+            placed[session.id] = old
+        } else {
+            placed[session.id] = Standing(rank: r, key: session.recency.timeIntervalSince1970)
+        }
+    }
+    standings = placed
     sessions.sort {
-        (rank[$0.state] ?? 3, -$0.recency.timeIntervalSince1970, $0.tty, $0.id)
-            < (rank[$1.state] ?? 3, -$1.recency.timeIntervalSince1970, $1.tty, $1.id)
+        let a = placed[$0.id]!, b = placed[$1.id]!
+        return (a.rank, -a.key, $0.tty, $0.id) < (b.rank, -b.key, $1.tty, $1.id)
     }
     return Snapshot(sessions: sessions, tabs: tabs, focused: focused)
 }
+
+/// A session's status group and its place in it, kept from poll to poll.
+struct Standing {
+    let rank: Int
+    let key: Double
+}
+
+/// Each session's standing at the last poll. Only `takeSnapshot` uses it, one poll at a time.
+var standings: [String: Standing] = [:]
 
 /// Runs `tool` with `arguments` and returns what it prints.
 func output(_ tool: String, _ arguments: [String]) -> String {
