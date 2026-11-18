@@ -382,7 +382,44 @@ enum Terminal {
 
     /// Types `text` into the tab on `tty` and presses Return, as if you had
     /// typed it there. Line breaks become spaces: each would submit on its own.
+    /// Claude Code can take text arriving all at once as a paste, Return and all,
+    /// leaving it in the input box unsent; if it is still there a moment later,
+    /// Return is pressed again, on its own. Only then: a stray Return could
+    /// answer a question Claude is asking.
     static func send(_ text: String, to tty: String) {
+        type(text, to: tty)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) {
+            guard unsent(text, on: tty) else { return }
+            DispatchQueue.main.async { type("", to: tty) }
+        }
+    }
+
+    /// Whether Claude Code's input box on `tty` still holds `text` (or a paste
+    /// placeholder for it). Runs off the main thread.
+    static func unsent(_ text: String, on tty: String) -> Bool {
+        let source = """
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(tty)" then return contents of (contents of t)
+                end repeat
+            end repeat
+            return ""
+        end tell
+        """
+        let lines = (runInBackground(source) ?? "").components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        // The input box: the line starting ❯ under the last rule, and any wrapped lines after it.
+        guard let rule = lines.indices.last(where: { i in
+            lines[i].hasPrefix("──") && lines[(i + 1)...].first(where: { !$0.isEmpty })?.hasPrefix("❯") == true
+        }) else { return false }
+        let box = lines[(rule + 1)...].prefix { !$0.hasPrefix("──") }.joined(separator: " ")
+        let start = String(text.components(separatedBy: .newlines).joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces).prefix(24))
+        return box.contains("[Pasted text") || (!start.isEmpty && box.contains(start))
+    }
+
+    /// `do script`: types `text` into the tab on `tty`, then Return.
+    private static func type(_ text: String, to tty: String) {
         let line = text.components(separatedBy: .newlines).joined(separator: " ")
             .replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         _ = run("""
