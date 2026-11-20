@@ -627,6 +627,43 @@ enum Terminal {
         do { try process.run() } catch { log("Claude Notifier: could not open a Popcorn terminal: \(error)") }
     }
 
+    /// Gives the tab on `tty` another random Popcorn theme, one already installed as a
+    /// Terminal profile, and renames its window to match if it was named after the old
+    /// theme. The running program carries on. Returns the new theme's name.
+    @discardableResult
+    static func reroll(tty: String) -> String? {
+        let dir = ProcessInfo.processInfo.environment["POPCORN_THEMES"]
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/github/random/macos-terminal-themes/themes").path
+        let themes = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+            .filter { $0.hasSuffix(".terminal") }
+            .map { "\"\(String($0.dropLast(9)).replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\"" }
+        guard !themes.isEmpty else { log("Claude Notifier: no Popcorn themes in \(dir)"); return nil }
+        let name = run("""
+        tell application "Terminal"
+            set themes to {\(themes.joined(separator: ", "))}
+            set installed to name of every settings set
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(tty)" then
+                        set old to name of current settings of t
+                        set choices to {}
+                        repeat with n in themes
+                            if installed contains (contents of n) and (contents of n) is not old then set end of choices to (contents of n)
+                        end repeat
+                        if choices is {} then return ""
+                        set theme to some item of choices
+                        set current settings of t to settings set theme
+                        if custom title of w is old then set custom title of w to theme
+                        return theme
+                    end if
+                end repeat
+            end repeat
+            return ""
+        end tell
+        """)
+        return name?.isEmpty == false ? name : nil
+    }
+
     /// Runs AppleScript through osascript, which is safe off the main thread
     /// (NSAppleScript is not). For the polls; actions you take use `run`.
     static func runInBackground(_ source: String) -> String? {
@@ -957,6 +994,8 @@ struct DetailView: View {
                 Button("New Popcorn terminal here") { Terminal.popcorn(in: session.cwd) }
                     .disabled(session.cwd.isEmpty)
                     .help(session.cwd.isEmpty ? "This session's directory is unknown" : "A plain shell in \(session.path)")
+                Button("Re-roll theme") { Terminal.reroll(tty: session.tty) }
+                    .help("Give this window another random Popcorn theme")
                 Button("Bring to front") { Terminal.focus(tty: session.tty) }
                     .keyboardShortcut(.defaultAction)
                 Button("Close…", role: .destructive) { model.closing = session }
@@ -1484,6 +1523,8 @@ final class RemoteServer {
     var history: (Session) -> String = { Terminal.history(tty: $0.tty, lines: 400) }
     var screen: (Session) -> String = { Terminal.screen($0.tty) }
     var transcript: (Session) -> String = { conversation($0.id) }
+    /// Gives a session's tab another theme, on the main thread; returns the theme's name.
+    var reroll: (Session) -> String? = { Terminal.reroll(tty: $0.tty) }
     /// Only for the demo: answer on this computer alone.
     var localOnly = false
 
@@ -1810,6 +1851,15 @@ final class RemoteServer {
         case ("POST", "/api/focus"):
             guard let session else { return respond(connection, 404, ["error": "No such session"]) }
             act(.focus(session), connection)
+        case ("POST", "/api/theme"):
+            guard let session else { return respond(connection, 404, ["error": "No such session"]) }
+            DispatchQueue.main.async {
+                let theme = self.reroll(session)
+                self.queue.async {
+                    if let theme { self.respond(connection, 200, ["ok": true, "theme": theme]) }
+                    else { self.respond(connection, 409, ["error": "No other theme to pick"]) }
+                }
+            }
         case ("POST", "/api/close"):
             guard let session else { return respond(connection, 404, ["error": "No such session"]) }
             act(.close(session), connection)

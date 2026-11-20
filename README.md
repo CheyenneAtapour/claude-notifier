@@ -83,6 +83,8 @@ From here you can:
   its own;
 - **New Popcorn terminal here** — open a plain shell in the session's directory
   (see [Popcorn windows](#popcorn-windows));
+- **Re-roll theme** — give the session's window another random Popcorn theme,
+  there and then. Claude keeps running;
 - **Close…** — exit Claude in that window and close it, after you confirm. The
   conversation is kept, and the confirmation shows the `claude --resume` command
   to reopen it. A window with other tabs, or still running something else, stays
@@ -160,6 +162,7 @@ one for its scrollback and a prompt box. It works from a hardware keyboard:
 | <kbd>X</kbd> | close it, after you confirm (<kbd>Y</kbd> / <kbd>N</kbd>) | the same, when not typing |
 | <kbd>N</kbd> | start a new session: a folder (created if you ask), fresh or a copy of a session's context | |
 | <kbd>Alt</kbd> + <kbd>W</kbd> <kbd>E</kbd> <kbd>R</kbd> <kbd>S</kbd> <kbd>D</kbd> <kbd>F</kbd> <kbd>X</kbd> <kbd>C</kbd> <kbd>V</kbd> | pick option 1–9 in a menu Claude shows | the same |
+| <kbd>R</kbd> | | re-roll the window's theme on the Mac, when not typing |
 | <kbd>T</kbd> (<kbd>Alt</kbd>+<kbd>T</kbd> while typing) | | switch between the terminal and the transcript |
 | <kbd>Esc</kbd> or Back | | back a step: out of full screen, then to the list, keeping your draft |
 
@@ -207,9 +210,13 @@ swiftc -O ClaudeNotifier.swift -o /tmp/ClaudeNotifier && /tmp/ClaudeNotifier --s
 
 ## Install
 
-Needs macOS, Terminal.app, the Xcode command line tools (`swiftc`) and `jq`.
+Needs macOS, Terminal.app, the Xcode command line tools (`swiftc`), `jq` and
+[Popcorn Terminal](https://github.com/CheyenneAtapour/macos-terminal-themes): its
+themes are what new sessions, forks and **Re-roll theme** pick from. Clone it where
+the notifier looks for it (or point `$POPCORN_THEMES` at its `themes` folder):
 
 ```sh
+git clone https://github.com/CheyenneAtapour/macos-terminal-themes.git ~/Documents/github/random/macos-terminal-themes
 git clone https://github.com/CheyenneAtapour/claude-notifier.git
 cd claude-notifier
 ./install.sh
@@ -256,6 +263,11 @@ errors go to `~/.claude/notifier/notifier.log`.
 from `$POPCORN_THEMES` (default
 `~/Documents/github/random/macos-terminal-themes/themes`), in `dir`, optionally
 running `command`. New sessions from the dashboard and `bin/claude-fork` use it.
+
+**Re-roll theme** (in a session on the dashboard, or <kbd>R</kbd> on the phone)
+switches a running window to another random theme from the same folder. It picks
+from the themes Terminal already has as profiles, which grow as Popcorn opens
+windows in new ones, and renames the window if it was named after its old theme.
 
 ## Screenshots
 

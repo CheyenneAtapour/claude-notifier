@@ -158,6 +158,7 @@
     <div class="actions">
       <button id="d-front">To front</button>
       <button id="d-label">Label…</button>
+      <button id="d-theme">Re-roll theme <kbd>R</kbd></button>
       <button id="d-close" class="danger">Close…</button>
       <button id="d-transcript">Transcript <kbd>T</kbd></button>
       <button id="d-full">⛶ Full screen <kbd>Alt</kbd><kbd>G</kbd></button>
@@ -228,6 +229,15 @@ async function act(path, body, okText) {
   try {
     await api(path, body);
     if (okText) flash(okText);
+  } catch (error) {
+    if (error.message !== "signed out") flash(error.message, true);
+  }
+}
+
+async function reroll() {
+  try {
+    const { theme } = await api("/api/theme", { id: openId });
+    flash(`Theme: ${theme}`);
   } catch (error) {
     if (error.message !== "signed out") flash(error.message, true);
   }
@@ -619,6 +629,7 @@ document.addEventListener("keydown", (e) => {
     if (key === "f") { e.preventDefault(); setFull(!document.body.classList.contains("full")); $("prompt").focus(); return; }
     if (key === "t") { e.preventDefault(); setReading(!reading); return; }
     if (key === "b") { e.preventDefault(); act("/api/focus", { id: openId }, "Brought to front on the Mac"); }
+    else if (key === "r") { e.preventDefault(); reroll(); }
     else if (key === "l") { e.preventDefault(); editLabel(current()); }
     else if (key === "x") { e.preventDefault(); confirmClose(current()); }
     else if (e.key.length === 1 && !e.altKey) $("prompt").focus();   // typing starts a prompt
@@ -676,6 +687,7 @@ $("prompt").addEventListener("keydown", (e) => {
 });
 
 $("back").addEventListener("click", () => { if (openId) drafts[openId] = $("prompt").value; showList(); });
+$("d-theme").addEventListener("click", () => reroll());
 $("d-front").addEventListener("click", () => act("/api/focus", { id: openId }, "Brought to front on the Mac"));
 $("d-label").addEventListener("click", () => editLabel(current()));
 $("d-close").addEventListener("click", () => confirmClose(current()));
