@@ -1986,10 +1986,21 @@ final class PhoneAlerts {
         var delay: TimeInterval = 10
     }
 
+    struct Sent: Codable {
+        var state: String
+        /// ntfy's id for the notification. Each is used once: the phone ignores a message
+        /// reusing the id of one it deleted.
+        var sequence: String
+    }
+
     static let file = notifierDir.appendingPathComponent("ntfy.json")
+    /// What the phone was last told, kept so a restart can still remove those notifications.
+    static let sentFile = notifierDir.appendingPathComponent("ntfy-sent.json")
     private(set) var config: Config
     /// What the phone was last told for each session, and statuses still waiting out the delay.
-    private var sent: [String: String] = [:]
+    private var sent: [String: Sent] = [:] {
+        didSet { try? JSONEncoder().encode(sent).write(to: PhoneAlerts.sentFile) }
+    }
     private var pending: [String: (state: String, since: Date)] = [:]
     /// The first update after starting only notes what already counts, so a restart doesn't buzz.
     private var primed = false
@@ -2002,6 +2013,10 @@ final class PhoneAlerts {
             config = Config()
         }
         if config.topic.isEmpty { newTopic() }
+        if let data = try? Data(contentsOf: PhoneAlerts.sentFile),
+           let saved = try? JSONDecoder().decode([String: Sent].self, from: data) {
+            sent = saved
+        }
     }
 
     /// A new random topic; the phone has to subscribe to it again.
@@ -2030,31 +2045,33 @@ final class PhoneAlerts {
         var counting: [String: Session] = [:]
         for session in sessions where session.state == "done" || session.state == "input" { counting[session.id] = session }
         guard primed else {
-            sent = counting.mapValues(\.state)
+            for (id, session) in counting where sent[id] == nil { sent[id] = Sent(state: session.state, sequence: "") }
             primed = true
             return
         }
-        for id in Array(sent.keys) where counting[id] == nil {
-            delete(id)
+        for (id, notice) in sent where counting[id] == nil {
+            delete(notice.sequence)
             sent[id] = nil
         }
         pending = pending.filter { counting[$0.key]?.state == $0.value.state }
         let now = Date()
-        for (id, session) in counting where sent[id] != session.state {
+        for (id, session) in counting where sent[id]?.state != session.state {
             guard let since = pending[id]?.since else {
                 pending[id] = (session.state, now)
                 continue
             }
             guard now.timeIntervalSince(since) >= config.delay else { continue }
             let input = session.state == "input"
+            // A status change replaces the session's notification; a new one gets a new id.
+            let sequence = sent[id].flatMap { $0.sequence.isEmpty ? nil : $0.sequence } ?? fresh(id)
             send([
                 "title": name(session),
                 "message": input ? (session.message.isEmpty ? "Needs you" : "Needs you: \(session.message)") : "Done",
                 "tags": [input ? "bell" : "white_check_mark"],
                 "priority": input ? 4 : 3,
-                "sequence_id": sequence(id),
+                "sequence_id": sequence,
             ].merging(click.map { ["click": "\($0)/#\(id)"] } ?? [:]) { a, _ in a })
-            sent[id] = session.state
+            sent[id] = Sent(state: session.state, sequence: sequence)
             pending[id] = nil
         }
     }
@@ -2072,14 +2089,15 @@ final class PhoneAlerts {
 
     /// Deletes every notification this sent, as when turning it off.
     private func clearAll() {
-        for id in sent.keys { delete(id) }
+        for notice in sent.values { delete(notice.sequence) }
         sent = [:]
         pending = [:]
     }
 
-    /// ntfy's id for a session's notification: letters, digits, - and _.
-    private func sequence(_ id: String) -> String {
-        "s" + String(id.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }.prefix(60))
+    /// A new ntfy id for a session's notification: letters, digits, - and _.
+    private func fresh(_ id: String) -> String {
+        let session = id.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }.prefix(40)
+        return "s\(session)_" + String(Int(Date().timeIntervalSince1970 * 1000), radix: 36)
     }
 
     private func send(_ message: [String: Any]) {
@@ -2091,8 +2109,8 @@ final class PhoneAlerts {
         perform(request)
     }
 
-    private func delete(_ id: String) {
-        guard let url = URL(string: "\(config.server)/\(config.topic)/\(sequence(id))") else { return }
+    private func delete(_ sequence: String) {
+        guard !sequence.isEmpty, let url = URL(string: "\(config.server)/\(config.topic)/\(sequence)") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         perform(request)
