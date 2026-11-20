@@ -74,7 +74,8 @@ From here you can:
 
 - **label it** — type a name in the **Label** field, say "Rate limiter". It shows
   as a tag under the window's name on its card, and beside it here, and nowhere outside
-  the dashboard. It is kept until you clear it: after restarts, when you
+  the dashboard. Click a colour beside the field to colour the tag (the phone's
+  **Label…** has the same colours). It is kept until you clear it: after restarts, when you
   resume the session, and after `/clear` in the same window;
 - **Bring to front** — focus the session's Terminal tab;
 - **send it a prompt** — type in the box at the bottom and press Send (or ⌘↩).

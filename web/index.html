@@ -61,6 +61,9 @@
   .tag { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px; flex: none;
     color: var(--tag); background: color-mix(in srgb, var(--tag) 16%, transparent); }
   .tag::before { content: "🏷 "; font-size: 10px; }
+  .swatches { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 4px; }
+  .swatch { width: 26px; height: 26px; padding: 0; border-radius: 50%; border: none; }
+  .swatch.on { outline: 2px solid var(--text); outline-offset: 3px; }
   .place { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .task { margin-top: 3px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .task.none { color: var(--muted); }
@@ -328,12 +331,19 @@ function pill(session) {
   return p;
 }
 
-function tag(text) {
+function tag(text, color) {
   const t = document.createElement("span");
   t.className = "tag";
   t.textContent = text;
+  if (color) t.style.setProperty("--tag", color);
   return t;
 }
+
+// The colours a label can have, as on the Mac.
+const labelColors = {
+  purple: "#af52de", pink: "#ff2d55", red: "#ff3b30", orange: "#ff9500", yellow: "#ffcc00",
+  green: "#34c759", teal: "#30b0c7", blue: "#007aff", gray: "#8e8e93",
+};
 
 function el(tag, className, text) {
   const e = document.createElement(tag);
@@ -373,7 +383,7 @@ function card(s, i) {
   top.append(el("span", "num", i < 9 ? String(i + 1) : ""), pill(s), el("span", "name", s.name));
   c.append(top);
   const second = el("div", "row");
-  if (s.label) second.append(tag(s.label));
+  if (s.label) second.append(tag(s.label, s.labelColor));
   if (s.place) second.append(el("span", "place", s.place));
   if (second.childNodes.length) c.append(second);
   c.append(el("div", "task" + (s.task ? "" : " none"), s.task || "No prompt seen yet"));
@@ -415,7 +425,7 @@ function renderDetail() {
   $("d-name").textContent = s.name;
   const tags = $("d-tags");
   tags.replaceChildren(pill(s));
-  if (s.label) tags.append(tag(s.label));
+  if (s.label) tags.append(tag(s.label, s.labelColor));
   $("d-place").textContent = s.place;
   $("d-task").textContent = s.task || "No prompt seen yet";
   $("d-task").className = "task" + (s.task ? "" : " none");
@@ -489,13 +499,27 @@ function buttons(...list) {
 function editLabel(s) {
   if (!s) return;
   let input;
-  const save = () => { act("/api/label", { id: s.id, text: input.value.trim() }); closeDialog(); };
+  let color = Object.keys(labelColors).find((name) => labelColors[name] === s.labelColor) || "purple";
+  const save = () => { act("/api/label", { id: s.id, text: input.value.trim(), color }); closeDialog(); };
   openDialog((box) => {
     box.append(el("h2", "", "Label"), el("p", "", `${s.name} — shown on the dashboards only. Leave empty to remove it.`));
     input = el("input");
     input.value = s.label;
     input.maxLength = 80;
-    box.append(input, buttons(["Cancel", "", closeDialog], ["Save", "primary", save]));
+    const swatches = el("div", "swatches");
+    for (const [name, hex] of Object.entries(labelColors)) {
+      const b = el("button", name === color ? "swatch on" : "swatch");
+      b.type = "button";
+      b.title = name;
+      b.style.background = hex;
+      b.addEventListener("click", () => {
+        color = name;
+        for (const other of swatches.children) other.classList.toggle("on", other === b);
+        input.focus();
+      });
+      swatches.append(b);
+    }
+    box.append(input, swatches, buttons(["Cancel", "", closeDialog], ["Save", "primary", save]));
     setTimeout(() => { input.focus(); input.select(); });
   }, (e) => {
     if (e.key === "Enter") { e.preventDefault(); save(); }

@@ -733,6 +733,31 @@ struct SessionLabel: Codable, Equatable {
     var text: String
     var tty: String
     var opened: Double?
+    /// One of `LabelColor.names`; purple when unset.
+    var color: String?
+}
+
+/// The colours a label can have, Apple's system colours, by name.
+enum LabelColor {
+    static let names = ["purple", "pink", "red", "orange", "yellow", "green", "teal", "blue", "gray"]
+    static let hex = [
+        "purple": "#af52de", "pink": "#ff2d55", "red": "#ff3b30", "orange": "#ff9500", "yellow": "#ffcc00",
+        "green": "#34c759", "teal": "#30b0c7", "blue": "#007aff", "gray": "#8e8e93",
+    ]
+
+    static func color(_ name: String?) -> Color {
+        switch name {
+        case "pink": .pink
+        case "red": .red
+        case "orange": .orange
+        case "yellow": .yellow
+        case "green": .green
+        case "teal": .teal
+        case "blue": .blue
+        case "gray": .gray
+        default: .purple
+        }
+    }
 }
 
 final class DashboardModel: ObservableObject {
@@ -750,12 +775,15 @@ final class DashboardModel: ObservableObject {
     private var fetching = false
 
     func label(_ session: Session) -> String { labels[session.id]?.text ?? "" }
+    func labelColor(_ session: Session) -> String? { labels[session.id]?.color }
 
     /// Sets or (when blank) removes a session's label, and saves them all.
-    func setLabel(_ text: String, for session: Session) {
+    /// Sets the session's label; its colour stays unless `color` is given.
+    func setLabel(_ text: String, color: String? = nil, for session: Session) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let color = color.flatMap { LabelColor.names.contains($0) ? $0 : nil } ?? labels[session.id]?.color
         labels[session.id] = text.isEmpty ? nil
-            : SessionLabel(text: text, tty: session.tty, opened: session.opened?.timeIntervalSince1970)
+            : SessionLabel(text: text, tty: session.tty, opened: session.opened?.timeIntervalSince1970, color: color)
         saveLabels()
     }
 
@@ -844,6 +872,7 @@ struct StatusPill: View {
 /// Your label for a session, as a tag beside its window's name.
 struct LabelTag: View {
     let text: String
+    var color: String?
 
     var body: some View {
         Label(text, systemImage: "tag.fill")
@@ -851,8 +880,8 @@ struct LabelTag: View {
             .lineLimit(1)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(Capsule().fill(Color.purple.opacity(0.15)))
-            .foregroundStyle(.purple)
+            .background(Capsule().fill(LabelColor.color(color).opacity(0.15)))
+            .foregroundStyle(LabelColor.color(color))
             // Its own height, but no wider than there is room for: a long label
             // ends in "…" rather than pushing the card's contents out of the card.
             .fixedSize(horizontal: false, vertical: true)
@@ -928,6 +957,7 @@ struct SessionCard: View {
     let session: Session
     let tabs: [String: TerminalTab]
     var label = ""
+    var labelColor: String?
     /// The card's size; its preview takes whatever height is left.
     let size: CGSize
     let open: () -> Void
@@ -947,7 +977,7 @@ struct SessionCard: View {
             }
             if !label.isEmpty || !session.cwd.isEmpty {
                 HStack(spacing: 6) {
-                    if !label.isEmpty { LabelTag(text: label).layoutPriority(1) }
+                    if !label.isEmpty { LabelTag(text: label, color: labelColor).layoutPriority(1) }
                     Text(session.place).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
@@ -1004,7 +1034,9 @@ struct DetailView: View {
             HStack {
                 StatusPill(state: session.state)
                 Text(session.name(model.tabs)).font(.title3.bold()).lineLimit(1)
-                if !label.trimmingCharacters(in: .whitespaces).isEmpty { LabelTag(text: label.trimmingCharacters(in: .whitespaces)) }
+                if !label.trimmingCharacters(in: .whitespaces).isEmpty {
+                    LabelTag(text: label.trimmingCharacters(in: .whitespaces), color: model.labelColor(session))
+                }
             }
             HStack {
                 Text("Label").foregroundStyle(.secondary)
@@ -1012,6 +1044,19 @@ struct DetailView: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 360)
                     .onChange(of: label) { _, new in model.setLabel(new, for: session) }
+                if !label.trimmingCharacters(in: .whitespaces).isEmpty {
+                    ForEach(LabelColor.names, id: \.self) { name in
+                        let chosen = (model.labelColor(session) ?? "purple") == name
+                        Circle()
+                            .fill(LabelColor.color(name))
+                            .frame(width: 14, height: 14)
+                            .overlay(Circle().stroke(Color.primary, lineWidth: chosen ? 2 : 0).padding(-3))
+                            .padding(3)
+                            .contentShape(Circle())
+                            .onTapGesture { model.setLabel(label, color: name, for: session) }
+                            .help("Make the label \(name)")
+                    }
+                }
             }
             .help("Shown on its card in this dashboard; kept until you clear it")
             if !session.cwd.isEmpty { Text(session.place).font(.callout).foregroundStyle(.secondary) }
@@ -1174,7 +1219,7 @@ struct DashboardView: View {
                     spacing: GridLayout.spacing
                 ) {
                     ForEach(model.sessions) { session in
-                        SessionCard(session: session, tabs: model.tabs, label: model.label(session), size: layout.card,
+                        SessionCard(session: session, tabs: model.tabs, label: model.label(session), labelColor: model.labelColor(session), size: layout.card,
                                     open: { model.open(session) }, close: { model.closing = session })
                     }
                 }
@@ -1329,7 +1374,7 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         case .prompt(let session, let text): Terminal.send(text, to: session.tty)
         case .focus(let session): Terminal.focus(tty: session.tty)
         case .close(let session): Terminal.close(session)
-        case .label(let session, let text): dashboard.setLabel(text, for: session)
+        case .label(let session, let text, let color): dashboard.setLabel(text, color: color, for: session)
         case .choose(let session, let number, let text, let menu): Terminal.choose(number, text: text, in: menu, on: session.tty)
         case .seen(let session): if session.state == "done" { markIdle(session) }
         case .start(let directory, let source):
@@ -1552,7 +1597,7 @@ enum RemoteAction {
     case prompt(Session, String)
     case focus(Session)
     case close(Session)
-    case label(Session, String)
+    case label(Session, String, String?)
     case choose(Session, Int, String, Terminal.Menu)
     case seen(Session)
     case start(directory: String, source: String?)
@@ -1693,6 +1738,7 @@ final class RemoteServer {
                 "status": status(session.state).label,
                 "name": session.name(tabs),
                 "label": labels[session.id]?.text ?? "",
+                "labelColor": LabelColor.hex[labels[session.id]?.color ?? "purple"] ?? "",
                 "place": session.place,
                 "path": session.path,
                 "task": session.task,
@@ -1926,7 +1972,7 @@ final class RemoteServer {
             act(.close(session), connection)
         case ("POST", "/api/label"):
             guard let session else { return respond(connection, 404, ["error": "No such session"]) }
-            act(.label(session, String((body["text"] as? String ?? "").prefix(80))), connection)
+            act(.label(session, String((body["text"] as? String ?? "").prefix(80)), body["color"] as? String), connection)
         case ("POST", "/api/seen"):
             guard let session else { return respond(connection, 404, ["error": "No such session"]) }
             act(.seen(session), connection)
@@ -2256,8 +2302,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--serve-demo"), CommandLine.
     server.history = { tabs[$0.tty]?.contents ?? "" }
     server.screen = { tabs[$0.tty]?.contents ?? "" }
     server.perform = { action in
-        if case .label(let session, let text) = action {
-            labels[session.id] = text.isEmpty ? nil : SessionLabel(text: text, tty: session.tty)
+        if case .label(let session, let text, let color) = action {
+            labels[session.id] = text.isEmpty ? nil : SessionLabel(text: text, tty: session.tty, color: color ?? labels[session.id]?.color)
         }
         print("demo: \(action)")
         server.publish(sessions, tabs: tabs, labels: labels)
