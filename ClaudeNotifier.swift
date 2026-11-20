@@ -160,6 +160,54 @@ struct Standing {
 /// Each session's standing at the last poll. Only `takeSnapshot` uses it, one poll at a time.
 var standings: [String: Standing] = [:]
 
+/// The end of session `id`'s conversation, from Claude Code's transcript: your
+/// last `turns` prompts and Claude's replies to them in full, each tool it used
+/// on one line. Terminal keeps only the screenfuls Claude Code last drew, so its
+/// scrollback can't reach back this far. Empty if there is no transcript.
+func conversation(_ id: String, turns: Int = 6) -> String {
+    let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+    guard UUID(uuidString: id) != nil,
+          let dirs = try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil),
+          let url = dirs.map({ $0.appendingPathComponent("\(id).jsonl") })
+              .first(where: { FileManager.default.fileExists(atPath: $0.path) }),
+          let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+    defer { try? handle.close() }
+    // Transcripts grow to hundreds of megabytes; the last few hold the turns wanted.
+    let size = (try? handle.seekToEnd()) ?? 0
+    try? handle.seek(toOffset: size > 4_000_000 ? size - 4_000_000 : 0)
+    var lines = String(decoding: handle.readDataToEndOfFile(), as: UTF8.self).split(separator: "\n")
+    if size > 4_000_000, !lines.isEmpty { lines.removeFirst() }   // cut mid-line
+
+    var parts: [String] = []   // per turn: its prompt, then the replies
+    for line in lines {
+        guard let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              entry["isMeta"] as? Bool != true, entry["isSidechain"] as? Bool != true,
+              let message = entry["message"] as? [String: Any] else { continue }
+        switch entry["type"] as? String {
+        case "user":
+            // Your prompts are plain text; tool results, notes and interruptions are not prompts.
+            guard let text = message["content"] as? String,
+                  !text.hasPrefix("<"), !text.hasPrefix("[Request interrupted") else { continue }
+            parts.append("❯ " + text)
+        case "assistant":
+            guard !parts.isEmpty, let blocks = message["content"] as? [[String: Any]] else { continue }
+            for block in blocks {
+                if block["type"] as? String == "text", let text = block["text"] as? String {
+                    parts[parts.count - 1] += "\n\n⏺ " + text
+                } else if block["type"] as? String == "tool_use", let name = block["name"] as? String {
+                    let input = block["input"] as? [String: Any] ?? [:]
+                    let about = (input["description"] ?? input["file_path"] ?? input["command"] ?? input["pattern"]) as? String ?? ""
+                    let first = about.split(separator: "\n").first.map(String.init) ?? ""
+                    // One line each, under the text before it.
+                    parts[parts.count - 1] += "\n  ⎿ \(name)" + (first.isEmpty ? "" : ": \(first.prefix(120))")
+                }
+            }
+        default: continue
+        }
+    }
+    return parts.suffix(turns).joined(separator: "\n\n" + String(repeating: "─", count: 30) + "\n\n")
+}
+
 /// Runs `tool` with `arguments` and returns what it prints.
 func output(_ tool: String, _ arguments: [String]) -> String {
     let process = Process()
@@ -1435,6 +1483,7 @@ final class RemoteServer {
     /// A session's scrollback; run off the main thread.
     var history: (Session) -> String = { Terminal.history(tty: $0.tty, lines: 400) }
     var screen: (Session) -> String = { Terminal.screen($0.tty) }
+    var transcript: (Session) -> String = { conversation($0.id) }
     /// Only for the demo: answer on this computer alone.
     var localOnly = false
 
@@ -1719,6 +1768,12 @@ final class RemoteServer {
                 guard let self, let i = self.waiting.firstIndex(where: { $0.id == id }) else { return }
                 self.waiting.remove(at: i)
                 self.sendState(connection)
+            }
+        case ("GET", "/api/transcript"):
+            guard let session else { return respond(connection, 404, ["error": "No such session"]) }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let text = self.transcript(session)
+                self.queue.async { self.respond(connection, 200, ["text": text]) }
             }
         case ("GET", "/api/history"):
             guard let session else { return respond(connection, 404, ["error": "No such session"]) }

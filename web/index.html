@@ -80,7 +80,7 @@
   .send textarea { resize: none; min-height: 40px; max-height: 120px; }
 
   /* Full screen: the terminal and the prompt bar, nothing else. */
-  #exit-full { display: none; }
+  #exit-full, #full-transcript { display: none; }
   body.full #detail-view header, body.full #d-tags, body.full #d-place, body.full #d-task,
   body.full #d-message, body.full #d-estimate, body.full .actions, body.full #banner { display: none; }
   body.full #detail { padding: 0; gap: 0; }
@@ -88,7 +88,10 @@
   body.full .send { padding: 6px 8px; background: var(--bg); border-top: 1px solid var(--line); }
   body.full #exit-full { display: block; position: fixed; top: calc(6px + env(safe-area-inset-top)); right: 8px;
     z-index: 5; opacity: .75; padding: 2px 9px; }
+  body.full #full-transcript { display: block; position: fixed; top: calc(6px + env(safe-area-inset-top)); right: 48px;
+    z-index: 5; opacity: .75; padding: 2px 9px; }
   #d-screen { cursor: zoom-in; }
+  button.on { outline: 2px solid currentColor; }
 
   .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center;
     justify-content: center; padding: 16px; z-index: 10; }
@@ -156,7 +159,8 @@
       <button id="d-front">To front</button>
       <button id="d-label">Label…</button>
       <button id="d-close" class="danger">Close…</button>
-      <button id="d-full">⛶ Full screen <kbd>Alt</kbd><kbd>F</kbd></button>
+      <button id="d-transcript">Transcript <kbd>T</kbd></button>
+      <button id="d-full">⛶ Full screen <kbd>Alt</kbd><kbd>G</kbd></button>
     </div>
     <form class="send" id="send-form">
       <textarea id="prompt" rows="1" placeholder="Type a prompt, ↵ to send" autocapitalize="sentences"></textarea>
@@ -165,6 +169,7 @@
   </div>
 </section>
 
+<button id="full-transcript" title="Transcript or terminal (Alt+T)">T</button>
 <button id="exit-full" title="Leave full screen (Esc)">✕</button>
 
 <div id="overlay" class="overlay hidden"><div class="dialog" id="dialog"></div></div>
@@ -179,6 +184,7 @@ let selectedId = null;   // the card the keyboard is on
 let openId = null;       // the session shown large
 let dialog = null;       // { onKey } while a dialog is open
 let answering = null;    // { id, option } while you type the answer to an option
+let reading = false;     // showing the session's transcript, not its terminal
 const drafts = {};       // unsent prompts, by session
 
 // --- Talking to the Mac --------------------------------------------------
@@ -367,6 +373,7 @@ function current() { return sessions.find((s) => s.id === (openId || selectedId)
 
 function open(id) {
   if (answering?.id !== id) stopAnswering();
+  setReading(false, false);   // each session opens on its terminal
   openId = id;
   selectedId = id;
   $("list-view").classList.add("hidden");
@@ -399,6 +406,17 @@ function renderDetail() {
   if (!screen.textContent) screen.textContent = s.preview;
 }
 
+// The transcript: your last prompts and Claude's whole replies, which reach back
+// further than the terminal's scrollback. Shown in place of the terminal.
+function setReading(on, fetch = true) {
+  reading = on;
+  for (const id of ["d-transcript", "full-transcript"]) $(id).classList.toggle("on", on);
+  $("d-transcript").firstChild.textContent = on ? "Terminal " : "Transcript ";
+  if (!fetch) return;
+  $("d-screen").textContent = "";
+  fetchHistory(true);
+}
+
 // The large view's scrollback, every few seconds while it is open.
 let historyTimer;
 async function fetchHistory(first) {
@@ -406,8 +424,9 @@ async function fetchHistory(first) {
   const id = openId;
   if (!id) return;
   try {
-    const { text } = await api(`/api/history?id=${encodeURIComponent(id)}`);
-    if (openId !== id) return;
+    const wanted = reading;
+    const { text } = await api(`/api/${reading ? "transcript" : "history"}?id=${encodeURIComponent(id)}`);
+    if (openId !== id || reading !== wanted) return;
     const screen = $("d-screen");
     const atBottom = first || screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
     if (text && screen.textContent !== text) screen.textContent = text;
@@ -588,6 +607,7 @@ document.addEventListener("keydown", (e) => {
 
   if (openId) {
     if (e.key === "Escape") { e.preventDefault(); stepBack(); return; }
+    if (e.altKey && e.code === "KeyT") { e.preventDefault(); setReading(!reading); return; }
     // Alt+G works while typing a prompt; F alone when not.
     if (e.altKey && e.code === "KeyG") {
       e.preventDefault();
@@ -597,6 +617,7 @@ document.addEventListener("keydown", (e) => {
     if (typing) return;
     const key = e.key.toLowerCase();
     if (key === "f") { e.preventDefault(); setFull(!document.body.classList.contains("full")); $("prompt").focus(); return; }
+    if (key === "t") { e.preventDefault(); setReading(!reading); return; }
     if (key === "b") { e.preventDefault(); act("/api/focus", { id: openId }, "Brought to front on the Mac"); }
     else if (key === "l") { e.preventDefault(); editLabel(current()); }
     else if (key === "x") { e.preventDefault(); confirmClose(current()); }
@@ -661,6 +682,7 @@ $("d-close").addEventListener("click", () => confirmClose(current()));
 $("new-button").addEventListener("click", newSession);
 $("d-full").addEventListener("click", () => { setFull(true); $("prompt").focus(); });
 $("exit-full").addEventListener("click", () => setFull(false));
+for (const id of ["d-transcript", "full-transcript"]) $(id).addEventListener("click", () => setReading(!reading));
 // A tap on the terminal makes it full screen; a scroll or a text selection does not.
 $("d-screen").addEventListener("click", () => {
   if (document.body.classList.contains("full") || String(getSelection())) return;
