@@ -178,6 +178,7 @@ let sessions = [], directories = [], home = "~", version = -1;
 let selectedId = null;   // the card the keyboard is on
 let openId = null;       // the session shown large
 let dialog = null;       // { onKey } while a dialog is open
+let answering = null;    // { id, option } while you type the answer to an option
 const drafts = {};       // unsent prompts, by session
 
 // --- Talking to the Mac --------------------------------------------------
@@ -246,22 +247,41 @@ function showLogin() {
   $("code").focus();
 }
 
-// Full screen: only the terminal and the prompt bar, and without the browser's bars where it allows.
+// Full screen: only the terminal and the prompt bar. It fills the page, not the
+// phone's screen: the browser's own full screen announces itself every time.
 function setFull(on) {
   const screen = $("d-screen");
   const atBottom = screen.scrollHeight - screen.scrollTop - screen.clientHeight < 40;
   document.body.classList.toggle("full", on);
-  if (on && !document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {});
-  if (!on && document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
   if (atBottom) screen.scrollTop = screen.scrollHeight;
+  syncHistory();
 }
 
-// Leaving the browser's full screen (its back gesture, say) leaves ours too.
-document.addEventListener("fullscreenchange", () => {
-  if (!document.fullscreenElement && document.body.classList.contains("full")) setFull(false);
+// The phone's Back steps out one level, as Esc does: a dialog, then full screen,
+// then the session, back to the list. Each level open has its own history entry.
+let pushed = 0;     // entries this page has added
+let skipping = 0;   // our own steps back, whose popstate isn't a Back
+function depth() {
+  return (openId ? 1 : 0) + (document.body.classList.contains("full") ? 1 : 0) + (dialog ? 1 : 0);
+}
+function syncHistory() {
+  const d = depth();
+  while (pushed < d) history.pushState({ depth: ++pushed }, "");
+  if (pushed > d) { skipping++; history.go(d - pushed); pushed = d; }
+}
+function stepBack() {
+  if (dialog) closeDialog();
+  else if (document.body.classList.contains("full")) setFull(false);
+  else if (openId) { drafts[openId] = $("prompt").value; showList(); }
+}
+addEventListener("popstate", () => {
+  if (skipping) { skipping--; return; }
+  pushed = Math.max(0, pushed - 1);
+  stepBack();
 });
 
 function showList() {
+  stopAnswering();
   setFull(false);
   openId = null;
   $("login").classList.add("hidden");
@@ -269,6 +289,7 @@ function showList() {
   $("list-view").classList.remove("hidden");
   document.activeElement?.blur();
   render();
+  syncHistory();
 }
 
 function pill(session) {
@@ -345,6 +366,7 @@ function card(s, i) {
 function current() { return sessions.find((s) => s.id === (openId || selectedId)); }
 
 function open(id) {
+  if (answering?.id !== id) stopAnswering();
   openId = id;
   selectedId = id;
   $("list-view").classList.add("hidden");
@@ -356,6 +378,7 @@ function open(id) {
   const s = current();
   if (s && s.state === "done") act("/api/seen", { id });
   $("prompt").focus();
+  syncHistory();
 }
 
 function renderDetail() {
@@ -401,6 +424,7 @@ function openDialog(build, onKey) {
   build(box);
   $("overlay").classList.remove("hidden");
   dialog = { onKey };
+  syncHistory();
 }
 
 function closeDialog() {
@@ -408,6 +432,7 @@ function closeDialog() {
   dialog = null;
   document.activeElement?.blur();   // or keys would still go to the hidden dialog's field
   if (openId) $("prompt").focus();
+  syncHistory();
 }
 
 function buttons(...list) {
@@ -500,6 +525,38 @@ function newSession() {
   });
 }
 
+// --- Menus ------------------------------------------------------------------
+
+// Alt and one of these picks that option in a menu Claude shows (a question, or
+// asking permission): the letters the phone's keyboard has 1–9 on.
+const optionKeys = { KeyW: 1, KeyE: 2, KeyR: 3, KeyS: 4, KeyD: 5, KeyF: 6, KeyX: 7, KeyC: 8, KeyV: 9 };
+const promptHint = $("prompt").placeholder;
+
+// An option you type into ("Type something.") asks for your answer first: the
+// prompt box takes it, and Enter sends it as the answer.
+async function choose(option, text, id = current()?.id) {
+  if (!id) return;
+  try {
+    const reply = await api("/api/choose", { id, option, text });
+    if (reply.needsText) {
+      if (openId !== id) open(id);
+      answering = { id, option };
+      $("prompt").placeholder = `Your answer for ${option}. ${reply.label} ↵ to send, Esc to cancel`;
+      $("prompt").focus();
+      return;
+    }
+    flash(`Chose ${option}. ${reply.label}`);
+    if (openId) $("prompt").focus();
+  } catch (error) {
+    if (error.message !== "signed out") flash(error.message, true);
+  }
+}
+
+function stopAnswering() {
+  answering = null;
+  $("prompt").placeholder = promptHint;
+}
+
 // --- Keyboard ---------------------------------------------------------------
 
 function move(step) {
@@ -513,18 +570,21 @@ function move(step) {
 document.addEventListener("keydown", (e) => {
   if (!$("login").classList.contains("hidden")) return;
   if (dialog) {
-    if (e.key === "Escape") { e.preventDefault(); closeDialog(); return; }
+    if (e.key === "Escape") { e.preventDefault(); stepBack(); return; }
     dialog.onKey(e);
     return;
   }
   if (e.ctrlKey || e.metaKey) return;
+  // The keyboard's Alt layer may arrive as the digit itself, with or without Alt.
+  const option = optionKeys[e.code];
+  if (option && (e.altKey || e.key === String(option))) { e.preventDefault(); choose(option); return; }
+  if (e.key === "Escape" && answering) { e.preventDefault(); stopAnswering(); return; }
   const typing = ["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName);
 
   if (openId) {
-    if (e.key === "Escape" && document.body.classList.contains("full")) { e.preventDefault(); setFull(false); return; }
-    if (e.key === "Escape") { e.preventDefault(); drafts[openId] = $("prompt").value; showList(); return; }
-    // Alt+F works while typing a prompt; F alone when not.
-    if (e.altKey && e.code === "KeyF") {
+    if (e.key === "Escape") { e.preventDefault(); stepBack(); return; }
+    // Alt+G works while typing a prompt; F alone when not.
+    if (e.altKey && e.code === "KeyG") {
       e.preventDefault();
       setFull(!document.body.classList.contains("full"));
       return;
@@ -572,6 +632,13 @@ $("send-form").addEventListener("submit", (e) => {
   e.preventDefault();
   const text = $("prompt").value.trim();
   if (!text || !openId) return;
+  if (answering?.id === openId) {
+    choose(answering.option, text, openId);
+    stopAnswering();
+    $("prompt").value = "";
+    drafts[openId] = "";
+    return;
+  }
   act("/api/prompt", { id: openId, text }, "Sent");
   $("prompt").value = "";
   drafts[openId] = "";

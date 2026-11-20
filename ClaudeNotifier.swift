@@ -169,9 +169,20 @@ func output(_ tool: String, _ arguments: [String]) -> String {
     process.standardOutput = pipe
     process.standardError = FileHandle.nullDevice
     guard (try? process.run()) != nil else { return "" }
-    let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    // Read as it writes, so a long output can't fill the pipe and stall it; give up
+    // after a few seconds, as on a folder macOS hasn't yet let this app read.
+    var data = Data()
+    let read = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        data = pipe.fileHandleForReading.readDataToEndOfFile()
+        read.signal()
+    }
+    guard read.wait(timeout: .now() + 5) == .success else {
+        kill(process.processIdentifier, SIGKILL)
+        return ""
+    }
     process.waitUntilExit()
-    return out
+    return String(decoding: data, as: UTF8.self)
 }
 
 /// Running `claude` processes with a terminal, by device (e.g. /dev/ttys003): their pid and when they started.
@@ -403,31 +414,31 @@ enum Terminal {
     /// Types `text` into the tab on `tty` and presses Return, as if you had
     /// typed it there. Line breaks become spaces: each would submit on its own.
     /// Claude Code can take text arriving all at once as a paste, Return and all,
-    /// leaving it in the input box unsent; if it is still there a moment later,
-    /// Return is pressed again, on its own. Only then: a stray Return could
-    /// answer a question Claude is asking.
+    /// leaving it in the input box unsent. The box is checked for a few seconds,
+    /// as Claude Code can take a moment to show it there, and Return is pressed
+    /// again, on its own, while it is. Only then: a stray Return could answer a
+    /// question Claude is asking.
     static func send(_ text: String, to tty: String) {
         type(text, to: tty)
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) {
-            guard unsent(text, on: tty) else { return }
-            DispatchQueue.main.async { type("", to: tty) }
+        resend(text, to: tty, after: [0.5, 1, 1.5, 2])
+    }
+
+    /// Waits each of `delays` in turn, pressing Return whenever `text` is still unsent.
+    private static func resend(_ text: String, to tty: String, after delays: [Double]) {
+        guard let delay = delays.first else { return }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
+            let stuck = unsent(text, on: tty)
+            DispatchQueue.main.async {
+                if stuck { type("", to: tty) }
+                resend(text, to: tty, after: Array(delays.dropFirst()))
+            }
         }
     }
 
     /// Whether Claude Code's input box on `tty` still holds `text` (or a paste
     /// placeholder for it). Runs off the main thread.
     static func unsent(_ text: String, on tty: String) -> Bool {
-        let source = """
-        tell application "Terminal"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if tty of t is "\(tty)" then return contents of (contents of t)
-                end repeat
-            end repeat
-            return ""
-        end tell
-        """
-        let lines = (runInBackground(source) ?? "").components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        let lines = screen(tty).components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
         // The input box: the line starting ❯ under the last rule, and any wrapped lines after it.
         guard let rule = lines.indices.last(where: { i in
             lines[i].hasPrefix("──") && lines[(i + 1)...].first(where: { !$0.isEmpty })?.hasPrefix("❯") == true
@@ -438,16 +449,71 @@ enum Terminal {
         return box.contains("[Pasted text") || (!start.isEmpty && box.contains(start))
     }
 
-    /// `do script`: types `text` into the tab on `tty`, then Return.
-    private static func type(_ text: String, to tty: String) {
+    /// What the tab on `tty` shows now. Runs off the main thread.
+    static func screen(_ tty: String) -> String {
+        runInBackground("""
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(tty)" then return contents of (contents of t)
+                end repeat
+            end repeat
+            return ""
+        end tell
+        """) ?? ""
+    }
+
+    /// A menu of numbered options Claude Code is showing: a question it asks
+    /// you, or a permission prompt.
+    struct Menu {
+        var options: [Int: String] = [:]
+        var highlighted = 1
+
+        /// Whether option `number` is one you type an answer into.
+        func typed(_ number: Int) -> Bool {
+            guard let label = options[number] else { return false }
+            return label.hasPrefix("Type something") || label == "Other"
+        }
+    }
+
+    /// The menu in `screen`, if one is open: the numbered lines above its
+    /// "Esc to cancel" footer, back up to option 1.
+    static func menu(in screen: String) -> Menu? {
+        let lines = screen.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let footer = lines.lastIndex(where: { $0.contains("Esc to cancel") }) else { return nil }
+        let option = try! NSRegularExpression(pattern: #"^(❯\s*)?([1-9])\.\s+(.+)$"#)
+        var menu = Menu()
+        for line in lines[..<footer].reversed() {
+            guard let match = option.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+                  let number = Int(line[Range(match.range(at: 2), in: line)!]), menu.options[number] == nil else { continue }
+            menu.options[number] = String(line[Range(match.range(at: 3), in: line)!])
+            if match.range(at: 1).location != NSNotFound { menu.highlighted = number }
+            if number == 1 { break }
+        }
+        return menu.options.isEmpty ? nil : menu
+    }
+
+    /// Picks option `number` in `menu`, open on `tty`: arrows to it from the
+    /// highlighted one, then `text` (for an option you type into) and Return.
+    /// Arrows rather than its number key, as a number would go into a text
+    /// option's box if that one were highlighted.
+    static func choose(_ number: Int, text: String, in menu: Menu, on tty: String) {
+        type(text, to: tty, arrows: number - menu.highlighted)
+    }
+
+    /// `do script`: types `text` into the tab on `tty`, then Return; first
+    /// `arrows` presses of Down (or, negative, Up).
+    private static func type(_ text: String, to tty: String, arrows: Int = 0) {
         let line = text.components(separatedBy: .newlines).joined(separator: " ")
             .replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let arrow = "(ASCII character 27) & \"\(arrows > 0 ? "[B" : "[A")\" & "
+        let keys = String(repeating: arrow, count: abs(arrows))
         _ = run("""
         tell application "Terminal"
             repeat with w in windows
                 repeat with t in tabs of w
                     if tty of t is "\(tty)" then
-                        do script "\(line)" in t
+                        do script \(keys)"\(line)" in t
                         return
                     end if
                 end repeat
@@ -686,7 +752,9 @@ struct LabelTag: View {
             .padding(.vertical, 3)
             .background(Capsule().fill(Color.purple.opacity(0.15)))
             .foregroundStyle(.purple)
-            .fixedSize()
+            // Its own height, but no wider than there is room for: a long label
+            // ends in "…" rather than pushing the card's contents out of the card.
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -720,22 +788,38 @@ struct TerminalText: View {
     let size: CGFloat
     /// The terminal's own colours, if known.
     var tab: TerminalTab?
+    /// Whether to shrink the text, down to a floor, until its longest line fits:
+    /// a terminal far wider than its card would otherwise have every long line
+    /// wrap again, breaking its tables and indents. A line still too wide at the
+    /// floor wraps onto the next row.
+    var fit = false
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                Text(text.isEmpty ? " " : text)
-                    .font(.system(size: size, design: .monospaced))
-                    .foregroundStyle(tab?.foreground ?? Color(white: 0.92))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding(8)
-                    .id("end")
+        GeometryReader { geometry in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(text.isEmpty ? " " : text)
+                        .font(.system(size: fitted(geometry.size.width - 16), design: .monospaced))
+                        .foregroundStyle(tab?.foreground ?? Color(white: 0.92))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .id("end")
+                }
+                .onAppear { proxy.scrollTo("end", anchor: .bottom) }
+                .onChange(of: text) { proxy.scrollTo("end", anchor: .bottom) }
             }
-            .onAppear { proxy.scrollTo("end", anchor: .bottom) }
-            .onChange(of: text) { proxy.scrollTo("end", anchor: .bottom) }
         }
         .background(RoundedRectangle(cornerRadius: 6).fill(tab?.background ?? Color(white: 0.1)))
+    }
+
+    /// The font size: `size`, or, fitting, smaller until the longest line fits `width`
+    /// (a monospaced character is about 0.6 of the size wide), but no smaller than
+    /// 6 points, below which it is unreadable.
+    private func fitted(_ width: CGFloat) -> CGFloat {
+        guard fit else { return size }
+        let columns = text.split(separator: "\n", omittingEmptySubsequences: false).map(\.count).max() ?? 1
+        return min(size, max(6, width / (CGFloat(max(columns, 1)) * 0.6)))
     }
 }
 
@@ -762,7 +846,7 @@ struct SessionCard: View {
             }
             if !label.isEmpty || !session.cwd.isEmpty {
                 HStack(spacing: 6) {
-                    if !label.isEmpty { LabelTag(text: label) }
+                    if !label.isEmpty { LabelTag(text: label).layoutPriority(1) }
                     Text(session.place).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
@@ -774,7 +858,7 @@ struct SessionCard: View {
             }
             Text(estimate(session)).font(.caption).foregroundStyle(.secondary)
             TerminalText(text: Terminal.tail(tabs[session.tty]?.contents ?? "", 40),
-                         size: max(7, min(11, size.width / 48)), tab: tabs[session.tty])
+                         size: max(7, min(11, size.width / 48)), tab: tabs[session.tty], fit: true)
                 .frame(maxHeight: .infinity)
                 .allowsHitTesting(false)
         }
@@ -785,7 +869,6 @@ struct SessionCard: View {
         .overlay(alignment: .topTrailing) { NotificationDot(state: session.state).offset(x: 6, y: -6) }
         .contentShape(Rectangle())
         .onTapGesture(perform: open)
-        .help("Click for a larger view")
     }
 }
 
@@ -1131,6 +1214,7 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         case .focus(let session): Terminal.focus(tty: session.tty)
         case .close(let session): Terminal.close(session)
         case .label(let session, let text): dashboard.setLabel(text, for: session)
+        case .choose(let session, let number, let text, let menu): Terminal.choose(number, text: text, in: menu, on: session.tty)
         case .seen(let session): if session.state == "done" { markIdle(session) }
         case .start(let directory, let source):
             Terminal.popcorn(in: directory, running: source.map { "claude --resume \($0) --fork-session" } ?? "claude")
@@ -1308,6 +1392,7 @@ enum RemoteAction {
     case focus(Session)
     case close(Session)
     case label(Session, String)
+    case choose(Session, Int, String, Terminal.Menu)
     case seen(Session)
     case start(directory: String, source: String?)
 }
@@ -1333,6 +1418,7 @@ final class RemoteServer {
     var perform: (RemoteAction) -> Void = { _ in }
     /// A session's scrollback; run off the main thread.
     var history: (Session) -> String = { Terminal.history(tty: $0.tty, lines: 400) }
+    var screen: (Session) -> String = { Terminal.screen($0.tty) }
     /// Only for the demo: answer on this computer alone.
     var localOnly = false
 
@@ -1622,6 +1708,26 @@ final class RemoteServer {
                 let text = self.history(session)
                 self.queue.async { self.respond(connection, 200, ["text": text]) }
             }
+        case ("POST", "/api/choose"):
+            // An option you type into first answers needsText; the phone asks you, then sends it again with text.
+            guard let session else { return respond(connection, 404, ["error": "No such session"]) }
+            guard let number = body["option"] as? Int, (1...9).contains(number) else {
+                return respond(connection, 400, ["error": "No such option"])
+            }
+            let text = String((body["text"] as? String ?? "").filter { !$0.isASCII || $0.asciiValue! >= 32 }.prefix(20000))
+            DispatchQueue.global(qos: .userInitiated).async {
+                guard let menu = Terminal.menu(in: self.screen(session)), let label = menu.options[number] else {
+                    return self.queue.async { self.respond(connection, 409, ["error": "No option \(number) to choose"]) }
+                }
+                let typed = menu.typed(number)
+                if typed && text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    return self.queue.async { self.respond(connection, 200, ["needsText": true, "label": label]) }
+                }
+                DispatchQueue.main.async {
+                    self.perform(.choose(session, number, typed ? text : "", menu))
+                    self.queue.async { self.respond(connection, 200, ["ok": true, "label": label]) }
+                }
+            }
         case ("POST", "/api/prompt"):
             let text = (body["text"] as? String ?? "").filter { !$0.isASCII || $0.asciiValue! >= 32 || $0 == "\n" }
             guard let session, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -1808,6 +1914,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--serve-demo"), CommandLine.
     server.localOnly = true
     // The demo's own screens, never a real terminal's.
     server.history = { tabs[$0.tty]?.contents ?? "" }
+    server.screen = { tabs[$0.tty]?.contents ?? "" }
     server.perform = { action in
         if case .label(let session, let text) = action {
             labels[session.id] = text.isEmpty ? nil : SessionLabel(text: text, tty: session.tty)

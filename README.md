@@ -159,13 +159,22 @@ one for its scrollback and a prompt box. It works from a hardware keyboard:
 | <kbd>L</kbd> | label it | the same, when not typing |
 | <kbd>X</kbd> | close it, after you confirm (<kbd>Y</kbd> / <kbd>N</kbd>) | the same, when not typing |
 | <kbd>N</kbd> | start a new session: a folder (created if you ask), fresh or a copy of a session's context | |
-| <kbd>Esc</kbd> | | back to the list, keeping your draft |
+| <kbd>Alt</kbd> + <kbd>W</kbd> <kbd>E</kbd> <kbd>R</kbd> <kbd>S</kbd> <kbd>D</kbd> <kbd>F</kbd> <kbd>X</kbd> <kbd>C</kbd> <kbd>V</kbd> | pick option 1–9 in a menu Claude shows | the same |
+| <kbd>Esc</kbd> or Back | | back a step: out of full screen, then to the list, keeping your draft |
 
 In a session, typing goes straight into the prompt box. **Tap the terminal** (or
-**Full screen**, or <kbd>Alt</kbd>+<kbd>F</kbd>) to make it fill the whole screen with
+**Full screen**, or <kbd>Alt</kbd>+<kbd>G</kbd>) to make it fill the page with
 just the prompt bar under it, still scrolling and still taking prompts;
-<kbd>Esc</kbd>, <kbd>Alt</kbd>+<kbd>F</kbd> or the ✕ in the corner leaves full screen. Opening a finished
-session from the phone clears its red count, as looking at it on the Mac does.
+<kbd>Esc</kbd>, Back, <kbd>Alt</kbd>+<kbd>G</kbd> or the ✕ in the corner leaves full screen.
+Opened from the home-screen icon, the page has no browser bars, so full screen
+fills the phone. Opening a finished session from the phone clears its red
+count, as looking at it on the Mac does.
+
+When Claude asks you something with numbered options, or asks permission,
+<kbd>Alt</kbd> and the key the keyboard prints the number on picks that option,
+as the arrows and Return would on the Mac. For **Type something** the prompt box
+then takes your answer, and <kbd>Enter</kbd> sends it; after **Chat about this**,
+type to Claude as usual.
 
 **Keeping it safe.** Anyone who can send a session a prompt can run commands on
 your Mac, so:
