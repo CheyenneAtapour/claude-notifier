@@ -1245,6 +1245,8 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
     /// Phone access, off until you turn it on from the menu.
     let remote = RemoteServer(webDir: Bundle.main.resourceURL?.appendingPathComponent("web")
         ?? URL(fileURLWithPath: "web"))
+    /// Phone notifications through ntfy, off until you turn them on from the menu.
+    let alerts = PhoneAlerts()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
@@ -1293,6 +1295,7 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         primed = true
         clicked = false
         updateTitle()
+        notifyPhone()
         if dashboard.visible {
             dashboard.apply(snapshot)
             // The scrollback is costly to fetch; every third poll is enough.
@@ -1307,7 +1310,17 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         guard remote.running else { return }
         // Labels carry over to a session's successor in apply, which the phone needs too.
         if !dashboard.visible { dashboard.apply(snapshot) }
+        remote.subscribe = alerts.config.enabled ? alerts.subscribeLink : nil
         remote.publish(snapshot.sessions, tabs: snapshot.tabs, labels: dashboard.labels)
+    }
+
+    /// Tells the phone, through ntfy, which sessions need you or are done.
+    func notifyPhone() {
+        let tabs = snapshot.tabs
+        alerts.update(snapshot.sessions, name: { [dashboard] session in
+            let label = dashboard.label(session).trimmingCharacters(in: .whitespaces)
+            return session.name(tabs) + (label.isEmpty ? "" : " [\(label)]")
+        }, click: remote.running ? remote.addresses.first : nil)
     }
 
     /// Does what the phone asked.
@@ -1373,6 +1386,7 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         }
         menu.addItem(.separator())
         menu.addItem(phoneMenu())
+        menu.addItem(notificationsMenu())
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Claude Notifier", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
@@ -1406,6 +1420,49 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         item.submenu = menu
         return item
     }
+
+    /// Phone Notifications: turn them on or off, and the ntfy topic to subscribe to.
+    func notificationsMenu() -> NSMenuItem {
+        let item = NSMenuItem(title: "Phone Notifications", action: nil, keyEquivalent: "")
+        let menu = NSMenu()
+        let toggle = NSMenuItem(title: "Notify My Phone (ntfy)", action: #selector(toggleAlerts), keyEquivalent: "")
+        toggle.target = self
+        toggle.state = alerts.config.enabled ? .on : .off
+        menu.addItem(toggle)
+        menu.addItem(.separator())
+        let server = alerts.config.server.replacingOccurrences(of: "https://", with: "")
+        for line in ["In the ntfy app, subscribe to:", "\(alerts.config.topic)" + (server == "ntfy.sh" ? "" : " on \(server)")] {
+            let row = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+            row.isEnabled = false
+            menu.addItem(row)
+        }
+        for (title, action) in [("Copy Topic", #selector(copyTopic)), ("Send Test Notification", #selector(testAlerts))] {
+            let row = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            row.target = self
+            menu.addItem(row)
+        }
+        menu.addItem(.separator())
+        let topic = NSMenuItem(title: "New Topic (the phone must subscribe again)", action: #selector(newTopic), keyEquivalent: "")
+        topic.target = self
+        menu.addItem(topic)
+        item.submenu = menu
+        return item
+    }
+
+    @objc func toggleAlerts() {
+        alerts.setEnabled(!alerts.config.enabled)
+        notifyPhone()
+        publishRemote()
+    }
+
+    @objc func copyTopic() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(alerts.config.topic, forType: .string)
+    }
+
+    @objc func testAlerts() { alerts.test() }
+
+    @objc func newTopic() { alerts.newTopic() }
 
     @objc func togglePhone() {
         remote.setEnabled(!remote.running)
@@ -1446,6 +1503,7 @@ final class Notifier: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowD
         if let i = snapshot.sessions.firstIndex(where: { $0.id == session.id }) {
             snapshot.sessions[i].state = "idle"
             updateTitle()
+            notifyPhone()
             if dashboard.visible { dashboard.apply(snapshot) }
             publishRemote()
         }
@@ -1527,6 +1585,8 @@ final class RemoteServer {
     var reroll: (Session) -> String? = { Terminal.reroll(tty: $0.tty) }
     /// Only for the demo: answer on this computer alone.
     var localOnly = false
+    /// The ntfy link that subscribes the phone to its notifications, while they are on.
+    var subscribe: String?
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "claude-notifier.remote")
@@ -1648,7 +1708,8 @@ final class RemoteServer {
         }
         let dirs = Array(Set(sessions.map(\.path).filter { !$0.isEmpty })).sorted()
         queue.async {
-            let body: [String: Any] = ["sessions": list, "directories": dirs, "home": home]
+            var body: [String: Any] = ["sessions": list, "directories": dirs, "home": home]
+            if let subscribe = self.subscribe { body["subscribe"] = subscribe }
             guard let data = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else { return }
             self.sessions = sessions
             guard data != self.state else { return }
@@ -1906,6 +1967,144 @@ final class RemoteServer {
         }
         respond(connection, 200, ["ok": true],
                 headers: ["Set-Cookie: cn=\(config.token); Max-Age=31536000; Path=/; HttpOnly; SameSite=Strict"])
+    }
+}
+
+// MARK: - Phone notifications
+
+/// Notifies your phone through ntfy (https://ntfy.sh) when a session needs you or finishes, off
+/// until you turn it on from the menu. Each session has one notification, replaced when its status
+/// changes and deleted once it no longer counts: you saw it, answered it, or closed it. Only the
+/// session's name and status go out, never prompts or output, since anyone who knows the topic
+/// can read them.
+final class PhoneAlerts {
+    struct Config: Codable {
+        var enabled = false
+        var server = "https://ntfy.sh"
+        var topic = ""
+        /// Seconds a status must last before the phone hears of it, so a quick answer doesn't buzz.
+        var delay: TimeInterval = 10
+    }
+
+    static let file = notifierDir.appendingPathComponent("ntfy.json")
+    private(set) var config: Config
+    /// What the phone was last told for each session, and statuses still waiting out the delay.
+    private var sent: [String: String] = [:]
+    private var pending: [String: (state: String, since: Date)] = [:]
+    /// The first update after starting only notes what already counts, so a restart doesn't buzz.
+    private var primed = false
+
+    init() {
+        if let data = try? Data(contentsOf: PhoneAlerts.file),
+           let saved = try? JSONDecoder().decode(Config.self, from: data) {
+            config = saved
+        } else {
+            config = Config()
+        }
+        if config.topic.isEmpty { newTopic() }
+    }
+
+    /// A new random topic; the phone has to subscribe to it again.
+    func newTopic() {
+        clearAll()
+        let letters = Array("abcdefghijkmnpqrstuvwxyz23456789")
+        config.topic = "claude-" + String((0..<20).map { _ in letters[Int.random(in: 0..<letters.count)] })
+        save()
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        if !enabled { clearAll() }
+        config.enabled = enabled
+        primed = false
+        save()
+    }
+
+    private func save() {
+        guard let data = try? JSONEncoder().encode(config) else { return }
+        FileManager.default.createFile(atPath: PhoneAlerts.file.path, contents: data, attributes: [.posixPermissions: 0o600])
+    }
+
+    /// Brings the phone in line with the sessions that count, after each poll.
+    func update(_ sessions: [Session], name: (Session) -> String, click: String?) {
+        guard config.enabled else { return }
+        var counting: [String: Session] = [:]
+        for session in sessions where session.state == "done" || session.state == "input" { counting[session.id] = session }
+        guard primed else {
+            sent = counting.mapValues(\.state)
+            primed = true
+            return
+        }
+        for id in Array(sent.keys) where counting[id] == nil {
+            delete(id)
+            sent[id] = nil
+        }
+        pending = pending.filter { counting[$0.key]?.state == $0.value.state }
+        let now = Date()
+        for (id, session) in counting where sent[id] != session.state {
+            guard let since = pending[id]?.since else {
+                pending[id] = (session.state, now)
+                continue
+            }
+            guard now.timeIntervalSince(since) >= config.delay else { continue }
+            let input = session.state == "input"
+            send([
+                "title": name(session),
+                "message": input ? (session.message.isEmpty ? "Needs you" : "Needs you: \(session.message)") : "Done",
+                "tags": [input ? "bell" : "white_check_mark"],
+                "priority": input ? 4 : 3,
+                "sequence_id": sequence(id),
+            ].merging(click.map { ["click": "\($0)/#\(id)"] } ?? [:]) { a, _ in a })
+            sent[id] = session.state
+            pending[id] = nil
+        }
+    }
+
+    /// Opens the ntfy app on an Android phone, subscribed to this topic.
+    var subscribeLink: String {
+        let server = config.server.replacingOccurrences(of: "https://", with: "")
+        let insecure = server.hasPrefix("http://")
+        return "ntfy://\(server.replacingOccurrences(of: "http://", with: ""))/\(config.topic)?display=Claude+sessions" + (insecure ? "&secure=false" : "")
+    }
+
+    func test() {
+        send(["title": "Claude Notifier", "message": "Phone notifications work", "tags": ["white_check_mark"], "sequence_id": "test"])
+    }
+
+    /// Deletes every notification this sent, as when turning it off.
+    private func clearAll() {
+        for id in sent.keys { delete(id) }
+        sent = [:]
+        pending = [:]
+    }
+
+    /// ntfy's id for a session's notification: letters, digits, - and _.
+    private func sequence(_ id: String) -> String {
+        "s" + String(id.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }.prefix(60))
+    }
+
+    private func send(_ message: [String: Any]) {
+        guard let url = URL(string: config.server) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: message.merging(["topic": config.topic]) { a, _ in a })
+        perform(request)
+    }
+
+    private func delete(_ id: String) {
+        guard let url = URL(string: "\(config.server)/\(config.topic)/\(sequence(id))") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        perform(request)
+    }
+
+    private func perform(_ request: URLRequest) {
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if error != nil || !(200..<300).contains(status) {
+                log("Claude Notifier: ntfy \(request.httpMethod ?? "") failed: \(error.map { "\($0)" } ?? "status \(status)")")
+            }
+        }.resume()
     }
 }
 

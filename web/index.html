@@ -27,6 +27,8 @@
   button { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line);
     border-radius: 8px; padding: 6px 10px; }
   button:active { opacity: .7; }
+  #subscribe { color: inherit; text-decoration: none; white-space: nowrap; font-size: 14px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
   button.danger { color: var(--done); }
   button.primary { background: var(--focus); border-color: var(--focus); color: #fff; }
   button.primary.danger { background: var(--done); border-color: var(--done); color: #fff; }
@@ -128,6 +130,7 @@
 <section id="list-view" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0">
   <header>
     <h1>✳︎ Claude <span id="counts"></span></h1>
+    <a id="subscribe" class="hidden" href="#">🔔 Subscribe in ntfy</a>
     <button id="new-button">+ New</button>
   </header>
   <div id="banner" class="hidden"></div>
@@ -208,10 +211,18 @@ async function follow() {
       version = reply.version;
       sessions = reply.state.sessions || [];
       directories = reply.state.directories || [];
+      $("subscribe").classList.toggle("hidden", !reply.state.subscribe);
+      if (reply.state.subscribe) $("subscribe").href = reply.state.subscribe;
       home = reply.state.home || home;
       banner("");
       if ($("login").classList.contains("hidden") === false) showList();
       render();
+      // A phone notification links to its session as #<id>.
+      const linked = decodeURIComponent(location.hash.slice(1));
+      if (linked) {
+        history.replaceState(history.state, "", location.pathname);
+        if (sessions.some((s) => s.id === linked)) open(linked);
+      }
     } catch (error) {
       if (error.message === "signed out") return;
       banner("Can't reach the Mac. Retrying…");

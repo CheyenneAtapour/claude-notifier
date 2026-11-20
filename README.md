@@ -208,6 +208,31 @@ swiftc -O ClaudeNotifier.swift -o /tmp/ClaudeNotifier && /tmp/ClaudeNotifier --s
 # then open http://127.0.0.1:7879
 ```
 
+## Phone notifications
+
+The menu's **Phone Notifications** sends your phone a notification when a session
+needs you or finishes, through [ntfy](https://ntfy.sh), the free open-source push
+app (no account). To set it up:
+
+1. Install ntfy on your phone (Android: Play Store or F-Droid).
+2. In the menu, open **Phone Notifications** and turn on **Notify My Phone**.
+3. Subscribe to its topic, a long random name the notifier made up: tap
+   **🔔 Subscribe in ntfy** at the top of the phone page, which opens the app
+   subscribed, or type the topic from the menu into the app.
+4. Try **Send Test Notification**.
+
+Each session has one notification, which changes as its status does and is
+removed from the phone once the session stops counting in the menu bar: you
+looked at it on the Mac or the phone, answered it, or closed it. A status has to
+last 10 seconds before the phone hears of it, so answering straight away doesn't
+buzz; turn on **Instant delivery** for the topic in ntfy so Android doesn't delay
+it further. With phone access on, tapping a notification opens that session's page.
+
+Only each session's name, label and status go out, never prompts or output. They
+pass through ntfy.sh, and anyone who knows the topic can read them; **New Topic**
+gives you a fresh one. The topic, server and delay are in
+`~/.claude/notifier/ntfy.json`; set `server` to run your own ntfy.
+
 ## Install
 
 Needs macOS, Terminal.app, the Xcode command line tools (`swiftc`), `jq` and
