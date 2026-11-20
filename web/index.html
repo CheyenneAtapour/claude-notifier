@@ -576,8 +576,13 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.ctrlKey || e.metaKey) return;
   // The keyboard's Alt layer may arrive as the digit itself, with or without Alt.
+  // Only while Claude shows a menu with that option; otherwise the digit types as usual.
   const option = optionKeys[e.code];
-  if (option && (e.altKey || e.key === String(option))) { e.preventDefault(); choose(option); return; }
+  if (option && (e.altKey || e.key === String(option)) && (current()?.options || 0) >= option) {
+    e.preventDefault();
+    choose(option);
+    return;
+  }
   if (e.key === "Escape" && answering) { e.preventDefault(); stopAnswering(); return; }
   const typing = ["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName);
 

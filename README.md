@@ -172,7 +172,8 @@ count, as looking at it on the Mac does.
 
 When Claude asks you something with numbered options, or asks permission,
 <kbd>Alt</kbd> and the key the keyboard prints the number on picks that option,
-as the arrows and Return would on the Mac. For **Type something** the prompt box
+as the arrows and Return would on the Mac. With no menu open, those keys type
+their numbers as usual. For **Type something** the prompt box
 then takes your answer, and <kbd>Enter</kbd> sends it; after **Chat about this**,
 type to Claude as usual.
 

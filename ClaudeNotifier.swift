@@ -420,17 +420,18 @@ enum Terminal {
     /// question Claude is asking.
     static func send(_ text: String, to tty: String) {
         type(text, to: tty)
-        resend(text, to: tty, after: [0.5, 1, 1.5, 2])
+        resend(to: tty, after: [0.5, 1, 1.5, 2]) { unsent(text, on: tty) }
     }
 
-    /// Waits each of `delays` in turn, pressing Return whenever `text` is still unsent.
-    private static func resend(_ text: String, to tty: String, after delays: [Double]) {
+    /// Waits each of `delays` in turn, pressing Return whenever `stuck` (run off
+    /// the main thread) says what was typed is still unsent.
+    private static func resend(to tty: String, after delays: [Double], stuck: @escaping () -> Bool) {
         guard let delay = delays.first else { return }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
-            let stuck = unsent(text, on: tty)
+            let unsent = stuck()
             DispatchQueue.main.async {
-                if stuck { type("", to: tty) }
-                resend(text, to: tty, after: Array(delays.dropFirst()))
+                if unsent { type("", to: tty) }
+                resend(to: tty, after: Array(delays.dropFirst()), stuck: stuck)
             }
         }
     }
@@ -497,8 +498,20 @@ enum Terminal {
     /// highlighted one, then `text` (for an option you type into) and Return.
     /// Arrows rather than its number key, as a number would go into a text
     /// option's box if that one were highlighted.
+    /// An answer typed in can arrive as a paste whose Return doesn't submit it,
+    /// as a prompt can (see `send`): while the option's own box still holds the
+    /// answer, Return is pressed again. Only that box: the answer also shows in
+    /// the conversation once sent, above any next menu, where a Return would pick
+    /// that menu's highlighted option.
     static func choose(_ number: Int, text: String, in menu: Menu, on tty: String) {
         type(text, to: tty, arrows: number - menu.highlighted)
+        guard !text.isEmpty else { return }
+        let start = String(text.components(separatedBy: .newlines).joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces).prefix(24))
+        resend(to: tty, after: [0.5, 1, 1.5, 2]) {
+            guard let box = Terminal.menu(in: screen(tty))?.options[number] else { return false }
+            return box.contains(start) || box.contains("[Pasted text")
+        }
     }
 
     /// `do script`: types `text` into the tab on `tty`, then Return; first
@@ -611,12 +624,15 @@ enum Terminal {
 
     /// The last `count` lines of `text` before Claude Code's input box (the
     /// rule above its ❯ line, and everything under it), without trailing blank lines.
+    /// Only a box at the bottom counts, the rules above and below its ❯ line being
+    /// the last two: while Claude shows a menu there is none, and an older box
+    /// further up the scrollback would otherwise cut the menu off.
     static func tail(_ text: String, _ count: Int) -> String {
         var lines = text.components(separatedBy: "\n")
         let trimmed = lines.map { $0.trimmingCharacters(in: .whitespaces) }
         if let box = trimmed.indices.last(where: { i in
             trimmed[i].hasPrefix("──") && trimmed[(i + 1)...].first(where: { !$0.isEmpty })?.hasPrefix("❯") == true
-        }) {
+        }), trimmed[box...].filter({ $0.hasPrefix("──") }).count <= 2 {
             lines.removeSubrange(box...)
         }
         while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
@@ -1536,6 +1552,8 @@ final class RemoteServer {
                 "background": hex(tab?.background) ?? "#1e1e1e",
                 "foreground": hex(tab?.foreground) ?? "#e6e6e6",
                 "resumable": session.resumable,
+                // How many options a menu Claude shows has, so the phone's Alt keys pick them only then.
+                "options": Terminal.menu(in: tab?.contents ?? "")?.options.count ?? 0,
             ]
         }
         let dirs = Array(Set(sessions.map(\.path).filter { !$0.isEmpty })).sorted()
